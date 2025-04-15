@@ -2,85 +2,103 @@ import os
 import json
 import logging
 from aiogram import Bot, Dispatcher, types, executor
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-from markdown2 import markdown
 from docx import Document
 
-# Логирование
 logging.basicConfig(level=logging.INFO)
 
-# Telegram API
-API_TOKEN = os.getenv('API_TOKEN')
+API_TOKEN = os.getenv("API_TOKEN")
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher(bot)
 
-# Google Sheets
+# Google Sheets setup
 scope = ['https://spreadsheets.google.com/feeds','https://www.googleapis.com/auth/drive']
 creds_dict = json.loads(os.getenv('GOOGLE_CREDS_JSON'))
 creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
 gs = gspread.authorize(creds)
 sheet = gs.open('ReadyDoc MVP').sheet1
 
-# Хранилище сессий
+# Session store
 user_sessions = {}
 
+# Custom keyboard
+doc_kb = ReplyKeyboardMarkup(resize_keyboard=True)
+doc_kb.add(KeyboardButton("📄 NDA"), KeyboardButton("📃 Акт"), KeyboardButton("📝 Договор"))
+
 @dp.message_handler(commands=['start'])
-async def cmd_start(message: types.Message):
-    await message.reply("Привет! Я ReadyDocBot. Напиши /getdoc, чтобы получить документ.")
+async def start(message: types.Message):
+    await message.reply(
+        "Привет 👋 Я ReadyDoc — твой помощник по документам.
+
+"
+        "Могу подготовить NDA, акт или договор. Нажми /getdoc, чтобы начать 😊"
+    )
 
 @dp.message_handler(commands=['getdoc'])
-async def cmd_getdoc(message: types.Message):
+async def getdoc(message: types.Message):
     user_sessions[message.from_user.id] = {'step': 'choose_doc'}
-    await message.reply("Выберите документ: NDA, Act, Services")
+    await message.reply("Выбери документ, который тебе нужен:", reply_markup=doc_kb)
 
 @dp.message_handler(lambda m: user_sessions.get(m.from_user.id, {}).get('step') == 'choose_doc')
-async def process_choice(message: types.Message):
-    doc_type = message.text.strip().lower()
-    if doc_type not in ('nda', 'act', 'services'):
-        return await message.reply("Пожалуйста, выберите: NDA, Act или Services")
-    user_sessions[message.from_user.id] = {'step': 'collect', 'doc_type': doc_type, 'data': {}}
-    # Задаём первую переменную в зависимости от шаблона
-    await message.reply("Введите значение для {{название_стороны}}:")
+async def choose_doc(message: types.Message):
+    doc_map = {
+        "📄 NDA": "nda",
+        "📃 Акт": "act",
+        "📝 Договор": "services"
+    }
+    doc_choice = doc_map.get(message.text.strip())
+    if not doc_choice:
+        return await message.reply("Пожалуйста, выбери документ с кнопок ниже 👇", reply_markup=doc_kb)
+
+    user_sessions[message.from_user.id] = {
+        'step': 'collect',
+        'doc_type': doc_choice,
+        'data': {},
+        'fields': ['название_стороны', 'дата', 'номер_договора', 'сумма']
+    }
+    await message.reply("Отлично! Начнём 🧾
+Как называется твоя компания или имя исполнителя?")
 
 @dp.message_handler(lambda m: user_sessions.get(m.from_user.id, {}).get('step') == 'collect')
-async def process_collect(message: types.Message):
+async def collect_data(message: types.Message):
     session = user_sessions[message.from_user.id]
     data = session['data']
-    # Определяем, какие поля собирать
-    fields = ['название_стороны', 'дата', 'номер_договора', 'сумма']
-    idx = len(data)
-    key = fields[idx]
-    data[key] = message.text.strip()
-    if idx + 1 < len(fields):
-        await message.reply(f"Введите значение для {{{{{fields[idx+1]}}}}}:")
+    fields = session['fields']
+
+    current_field = fields[len(data)]
+    data[current_field] = message.text.strip()
+
+    if len(data) < len(fields):
+        next_field = fields[len(data)]
+        prompts = {
+            'дата': "📅 Какая дата в документе?",
+            'номер_договора': "📎 Какой номер у договора? (Если нет — напиши 'нет')",
+            'сумма': "💰 На какую сумму составлен документ (₽)?"
+        }
+        await message.reply(prompts.get(next_field, f"Введите значение для {next_field}:"))
     else:
-        # Всё собрано — записываем в Google Sheets
-        sheet.append_row([message.from_user.id, session['doc_type'], *data.values(), 'pending'])
-        # Генерируем документ
-        path = generate_doc(session['doc_type'], data, message.from_user.id)
-        await message.reply_document(open(path, 'rb'))
+        # Всё собрано — создаём документ
+        doc_path = generate_doc(session['doc_type'], data, message.from_user.id)
+        sheet.append_row([message.from_user.id, session['doc_type'], *data.values(), 'done'])
+        await message.reply("Готово! Я собрал документ 🛠")
+        await message.reply_document(open(doc_path, 'rb'))
+        await message.reply("Вот твой файл 📄
+Если что-то не так — напиши снова!")
         user_sessions.pop(message.from_user.id)
 
 def generate_doc(doc_type, data, user_id):
-    # Загружаем шаблон
     with open(f'templates/{doc_type}.md', encoding='utf-8') as f:
         text = f.read()
-
-    # Подставляем значения вручную через простой цикл (без .format)
     for key, value in data.items():
-        placeholder = f'{{{{{key}}}}}'  # превращает в {{название_стороны}}
-        text = text.replace(placeholder, value)
-
-    # Генерируем .docx
-    from docx import Document
+        text = text.replace(f'{{{{{key}}}}}', value)
     doc = Document()
     for line in text.split('\n'):
         doc.add_paragraph(line)
-    
-    output_path = f'/tmp/{user_id}_{doc_type}.docx'
-    doc.save(output_path)
-    return output_path
+    output = f'/tmp/{user_id}_{doc_type}.docx'
+    doc.save(output)
+    return output
 
 if __name__ == '__main__':
     executor.start_polling(dp, skip_updates=True)
