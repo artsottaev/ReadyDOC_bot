@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import asyncio
 from aiogram import Bot, Dispatcher, types, executor
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 import gspread
@@ -23,23 +24,34 @@ sheet = gs.open('ReadyDoc MVP').sheet1
 # Session store
 user_sessions = {}
 
-# Custom keyboard
+# Keyboards
 doc_kb = ReplyKeyboardMarkup(resize_keyboard=True)
 doc_kb.add(KeyboardButton("📄 NDA"), KeyboardButton("📃 Акт"), KeyboardButton("📝 Договор"))
 
+restart_kb = ReplyKeyboardMarkup(resize_keyboard=True)
+restart_kb.add(KeyboardButton("🔁 Новый документ"))
+
 @dp.message_handler(commands=['start'])
 async def start(message: types.Message):
+    name = message.from_user.first_name
     await message.reply(
-        "Привет 👋 Я ReadyDoc — твой помощник по документам.
+        f"Привет, {name}! 👋 Я — ReadyDoc.
 
 "
-        "Могу подготовить NDA, акт или договор. Нажми /getdoc, чтобы начать 😊"
+        "Я помогу тебе быстро собрать нужный документ 📄
+"
+        "Готов начать? Напиши /getdoc или выбери ниже 👇",
+        reply_markup=doc_kb
     )
 
 @dp.message_handler(commands=['getdoc'])
 async def getdoc(message: types.Message):
     user_sessions[message.from_user.id] = {'step': 'choose_doc'}
     await message.reply("Выбери документ, который тебе нужен:", reply_markup=doc_kb)
+
+@dp.message_handler(lambda m: m.text == "🔁 Новый документ")
+async def restart_flow(message: types.Message):
+    await getdoc(message)
 
 @dp.message_handler(lambda m: user_sessions.get(m.from_user.id, {}).get('step') == 'choose_doc')
 async def choose_doc(message: types.Message):
@@ -79,13 +91,15 @@ async def collect_data(message: types.Message):
         }
         await message.reply(prompts.get(next_field, f"Введите значение для {next_field}:"))
     else:
-        # Всё собрано — создаём документ
+        # Всё собрано — эффект генерации
+        await message.reply("Супер! Генерирую документ... ⏳")
+        await asyncio.sleep(1.5)
+
         doc_path = generate_doc(session['doc_type'], data, message.from_user.id)
         sheet.append_row([message.from_user.id, session['doc_type'], *data.values(), 'done'])
-        await message.reply("Готово! Я собрал документ 🛠")
         await message.reply_document(open(doc_path, 'rb'))
         await message.reply("Вот твой файл 📄
-Если что-то не так — напиши снова!")
+Хочешь создать ещё один?", reply_markup=restart_kb)
         user_sessions.pop(message.from_user.id)
 
 def generate_doc(doc_type, data, user_id):
