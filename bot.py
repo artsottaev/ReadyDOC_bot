@@ -63,16 +63,24 @@ async def process_collect(message: types.Message):
         user_sessions.pop(message.from_user.id)
 
 def generate_doc(doc_type, data, user_id):
-    # Загружаем Markdown
+    # Загружаем шаблон
     with open(f'templates/{doc_type}.md', encoding='utf-8') as f:
-        text = f.read().format(**data)
-    # Конвертируем в DOCX
+        text = f.read()
+
+    # Подставляем значения вручную через простой цикл (без .format)
+    for key, value in data.items():
+        placeholder = f'{{{{{key}}}}}'  # превращает в {{название_стороны}}
+        text = text.replace(placeholder, value)
+
+    # Генерируем .docx
+    from docx import Document
     doc = Document()
     for line in text.split('\n'):
         doc.add_paragraph(line)
-    out_path = f'/tmp/{user_id}_{doc_type}.docx'
-    doc.save(out_path)
-    return out_path
+    
+    output_path = f'/tmp/{user_id}_{doc_type}.docx'
+    doc.save(output_path)
+    return output_path
 
 if __name__ == '__main__':
     executor.start_polling(dp, skip_updates=True)
