@@ -1,0 +1,5 @@
+aiogram
+gspread
+oauth2client
+markdown2
+python-docx
