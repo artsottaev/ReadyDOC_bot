@@ -45,7 +45,7 @@ async def choose_doc(message: types.Message):
         "Акт": "act",
         "Договор": "services"
     }
-    doc_choice = doc_map.get(message.text.strip())
+    doc_choice = doc_map.get(message.text.strip().title())  # Привести текст к нормальному виду
     if not doc_choice:
         return await message.reply("Пожалуйста, выбери документ с кнопок ниже 👇", reply_markup=doc_kb)
 
@@ -81,7 +81,7 @@ async def collect_data(message: types.Message):
         sheet.append_row([message.from_user.id, session['doc_type'], *data.values(), 'done'])
         await message.reply_document(open(doc_path, 'rb'))
         await message.reply("Вот твой файл. Хочешь сделать ещё один? Просто нажми /getdoc")
-        user_sessions.pop(message.from_user.id)
+        user_sessions.pop(message.from_user.id, None)  # Очистка сессии
 
 def generate_doc(doc_type, data, user_id):
     with open(f'templates/{doc_type}.md', encoding='utf-8') as f:
@@ -94,6 +94,12 @@ def generate_doc(doc_type, data, user_id):
     output = f'/tmp/{user_id}_{doc_type}.docx'
     doc.save(output)
     return output
+
+# Обработчик ошибок
+@dp.errors_handler()
+async def on_error(update, exception):
+    logging.error(f"Error: {exception}")
+    return True  # Возвращаем True, чтобы не скрывать ошибку
 
 if __name__ == '__main__':
     executor.start_polling(dp, skip_updates=True)
