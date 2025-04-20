@@ -45,7 +45,7 @@ async def choose_doc(message: types.Message):
         "Акт": "act",
         "Договор": "services"
     }
-    doc_choice = doc_map.get(message.text.strip().title())  # Привести текст к нормальному виду
+    doc_choice = doc_map.get(message.text.strip().title())
     if not doc_choice:
         return await message.reply("Пожалуйста, выбери документ с кнопок ниже 👇", reply_markup=doc_kb)
 
@@ -53,9 +53,15 @@ async def choose_doc(message: types.Message):
         'step': 'collect',
         'doc_type': doc_choice,
         'data': {},
-        'fields': ['название_стороны', 'дата', 'номер_договора', 'сумма']
+        'fields': [
+            'название_заказчика',
+            'название_исполнителя',
+            'дата',
+            'номер_договора',
+            'сумма'
+        ]
     }
-    await message.reply("Отлично! Начнём.\nКак называется твоя компания или имя исполнителя?")
+    await message.reply("Отлично! Начнём.\nКак называется компания или ФИО заказчика?")
 
 @dp.message_handler(lambda m: user_sessions.get(m.from_user.id, {}).get('step') == 'collect')
 async def collect_data(message: types.Message):
@@ -69,6 +75,7 @@ async def collect_data(message: types.Message):
     if len(data) < len(fields):
         next_field = fields[len(data)]
         prompts = {
+            'название_исполнителя': "Как называется компания или ФИО исполнителя?",
             'дата': "Какая дата в документе?",
             'номер_договора': "Какой номер у договора? (Если нет — напиши 'нет')",
             'сумма': "На какую сумму составлен документ (₽)?"
@@ -81,7 +88,7 @@ async def collect_data(message: types.Message):
         sheet.append_row([message.from_user.id, session['doc_type'], *data.values(), 'done'])
         await message.reply_document(open(doc_path, 'rb'))
         await message.reply("Вот твой файл. Хочешь сделать ещё один? Просто нажми /getdoc")
-        user_sessions.pop(message.from_user.id, None)  # Очистка сессии
+        user_sessions.pop(message.from_user.id, None)
 
 def generate_doc(doc_type, data, user_id):
     with open(f'templates/{doc_type}.md', encoding='utf-8') as f:
@@ -94,12 +101,6 @@ def generate_doc(doc_type, data, user_id):
     output = f'/tmp/{user_id}_{doc_type}.docx'
     doc.save(output)
     return output
-
-# Обработчик ошибок
-@dp.errors_handler()
-async def on_error(update, exception):
-    logging.error(f"Error: {exception}")
-    return True  # Возвращаем True, чтобы не скрывать ошибку
 
 if __name__ == '__main__':
     executor.start_polling(dp, skip_updates=True)
