@@ -1,6 +1,6 @@
 aiogram==2.25.1
+openai==0.28.1
 gspread
 oauth2client
 markdown2
 python-docx
-openai
