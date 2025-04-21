@@ -163,13 +163,24 @@ async def handle_doc_request(message: types.Message):
     user_sessions.pop(message.from_user.id)
 
 def generate_doc(doc_type, data, user_id):
+    def normalize(value):
+        if isinstance(value, dict):
+            return "; ".join(f"{k}: {v}" for k, v in value.items())
+        elif isinstance(value, list):
+            return ", ".join(str(item) for item in value)
+        return str(value)
+
     with open(f'templates/{doc_type}.md', encoding='utf-8') as f:
         text = f.read()
+
     for key, value in data.items():
-        text = text.replace(f'{{{{{key}}}}}', value)
+        clean_value = normalize(value)
+        text = text.replace(f'{{{{{key}}}}}', clean_value)
+
     doc = Document()
     for line in text.split('\n'):
         doc.add_paragraph(line)
+
     output = f'/tmp/{user_id}_{doc_type}.docx'
     doc.save(output)
     return output
