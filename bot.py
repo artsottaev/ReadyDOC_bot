@@ -2,6 +2,7 @@ import os
 import json
 import logging
 import asyncio
+import openai
 from aiogram import Bot, Dispatcher, types, executor
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 import gspread
@@ -11,6 +12,9 @@ from docx import Document
 logging.basicConfig(level=logging.INFO)
 
 API_TOKEN = os.getenv("API_TOKEN")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+openai.api_key = OPENAI_API_KEY
+
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher(bot)
 
@@ -27,6 +31,19 @@ user_sessions = {}
 # Custom keyboard
 doc_kb = ReplyKeyboardMarkup(resize_keyboard=True)
 doc_kb.add(KeyboardButton("NDA"), KeyboardButton("Акт"), KeyboardButton("Договор"))
+
+# GPT запрос
+def ask_gpt(prompt_text):
+    response = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo",
+        messages=[
+            {"role": "system", "content": "Ты помощник по юридическим документам. Отвечай чётко и по делу."},
+            {"role": "user", "content": prompt_text}
+        ],
+        temperature=0.3,
+        max_tokens=500
+    )
+    return response.choices[0].message["content"]
 
 @dp.message_handler(commands=['start'])
 async def start(message: types.Message):
@@ -45,7 +62,7 @@ async def choose_doc(message: types.Message):
         "Акт": "act",
         "Договор": "services"
     }
-    doc_choice = doc_map.get(message.text.strip().title())
+    doc_choice = doc_map.get(message.text.strip())
     if not doc_choice:
         return await message.reply("Пожалуйста, выбери документ с кнопок ниже 👇", reply_markup=doc_kb)
 
@@ -53,15 +70,9 @@ async def choose_doc(message: types.Message):
         'step': 'collect',
         'doc_type': doc_choice,
         'data': {},
-        'fields': [
-            'название_заказчика',
-            'название_исполнителя',
-            'дата',
-            'номер_договора',
-            'сумма'
-        ]
+        'fields': ['название_стороны', 'дата', 'номер_договора', 'сумма']
     }
-    await message.reply("Отлично! Начнём.\nКак называется компания или ФИО заказчика?")
+    await message.reply("Отлично! Начнём.\nКак называется твоя компания или имя исполнителя?")
 
 @dp.message_handler(lambda m: user_sessions.get(m.from_user.id, {}).get('step') == 'collect')
 async def collect_data(message: types.Message):
@@ -75,7 +86,6 @@ async def collect_data(message: types.Message):
     if len(data) < len(fields):
         next_field = fields[len(data)]
         prompts = {
-            'название_исполнителя': "Как называется компания или ФИО исполнителя?",
             'дата': "Какая дата в документе?",
             'номер_договора': "Какой номер у договора? (Если нет — напиши 'нет')",
             'сумма': "На какую сумму составлен документ (₽)?"
@@ -88,7 +98,23 @@ async def collect_data(message: types.Message):
         sheet.append_row([message.from_user.id, session['doc_type'], *data.values(), 'done'])
         await message.reply_document(open(doc_path, 'rb'))
         await message.reply("Вот твой файл. Хочешь сделать ещё один? Просто нажми /getdoc")
-        user_sessions.pop(message.from_user.id, None)
+        user_sessions.pop(message.from_user.id)
+
+@dp.message_handler(commands=['smartdoc'])
+async def smartdoc(message: types.Message):
+    await message.reply("✍️ Напиши, какой документ тебе нужен. Например:\n\"Договор аренды оборудования на 3 месяца между ИП и ООО\"")
+    user_sessions[message.from_user.id] = {'step': 'awaiting_ai_prompt'}
+
+@dp.message_handler(lambda m: user_sessions.get(m.from_user.id, {}).get('step') == 'awaiting_ai_prompt')
+async def handle_ai_prompt(message: types.Message):
+    prompt = message.text.strip()
+    await message.reply("🔍 Думаю над вариантом...")
+    try:
+        result = ask_gpt(prompt)
+        await message.reply(f"🧠 Вот что я придумал:\n\n{result}")
+    except Exception as e:
+        await message.reply(f"Ошибка: {e}")
+    user_sessions.pop(message.from_user.id)
 
 def generate_doc(doc_type, data, user_id):
     with open(f'templates/{doc_type}.md', encoding='utf-8') as f:
