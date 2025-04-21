@@ -19,20 +19,24 @@ bot = Bot(token=API_TOKEN)
 dp = Dispatcher(bot)
 
 # Google Sheets setup
-scope = ['https://spreadsheets.google.com/feeds','https://www.googleapis.com/auth/drive']
+scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
 creds_dict = json.loads(os.getenv('GOOGLE_CREDS_JSON'))
 creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
 gs = gspread.authorize(creds)
 sheet = gs.open('ReadyDoc MVP').sheet1
 
-# Session store
 user_sessions = {}
 
-# Custom keyboard
 doc_kb = ReplyKeyboardMarkup(resize_keyboard=True)
 doc_kb.add(KeyboardButton("NDA"), KeyboardButton("Акт"), KeyboardButton("Договор"))
 
-# Запрос к GPT для обычной команды /smartdoc
+def normalize(value):
+    if isinstance(value, dict):
+        return "; ".join(f"{k}: {v}" for k, v in value.items())
+    elif isinstance(value, list):
+        return ", ".join(str(item) for item in value)
+    return str(value)
+
 def ask_gpt(prompt_text):
     response = openai.ChatCompletion.create(
         model="gpt-3.5-turbo",
@@ -45,7 +49,6 @@ def ask_gpt(prompt_text):
     )
     return response.choices[0].message["content"]
 
-# Запрос к GPT для автозаполнения шаблона
 def extract_doc_data(prompt_text):
     system_prompt = (
         "Ты юридический ассистент, помогаешь составить документ по шаблону. "
@@ -72,7 +75,7 @@ def extract_doc_data(prompt_text):
 @dp.message_handler(commands=['start'])
 async def start(message: types.Message):
     name = message.from_user.first_name or "друг"
-    await message.reply(f"Привет, {name}! Я — ReadyDoc.\n\nМогу подготовить NDA, акт или договор.\nНажми /getdoc, чтобы начать!")
+    await message.reply(f"Привет, {name}! Я — ReadyDoc. 🧠\n\nМогу подготовить NDA, акт или договор.\n\n🔹 /getdoc — ручное заполнение\n🔹 /autodoc — автогенерация с помощью ИИ")
 
 @dp.message_handler(commands=['getdoc'])
 async def getdoc(message: types.Message):
@@ -96,7 +99,7 @@ async def choose_doc(message: types.Message):
         'data': {},
         'fields': ['название_стороны', 'дата', 'номер_договора', 'сумма']
     }
-    await message.reply("Отлично! Начнём.\nКак называется твоя компания или имя исполнителя?")
+    await message.reply("Отлично! Как называется твоя компания или имя исполнителя?")
 
 @dp.message_handler(lambda m: user_sessions.get(m.from_user.id, {}).get('step') == 'collect')
 async def collect_data(message: types.Message):
@@ -119,26 +122,11 @@ async def collect_data(message: types.Message):
         await message.reply("Генерирую документ...")
         await asyncio.sleep(1.5)
         doc_path = generate_doc(session['doc_type'], data, message.from_user.id)
-        sheet.append_row([message.from_user.id, session['doc_type'], *data.values(), 'done'])
+        row = [str(message.from_user.id), session['doc_type']] + [normalize(v) for v in data.values()] + ['manual']
+        sheet.append_row(row)
         await message.reply_document(open(doc_path, 'rb'))
-        await message.reply("Вот твой файл. Хочешь сделать ещё один? Просто нажми /getdoc")
+        await message.reply("✅ Готово! Хочешь ещё один документ? Жми /getdoc")
         user_sessions.pop(message.from_user.id)
-
-@dp.message_handler(commands=['smartdoc'])
-async def smartdoc(message: types.Message):
-    await message.reply("✍️ Напиши, какой документ тебе нужен. Например:\n\"Договор аренды оборудования на 3 месяца между ИП и ООО\"")
-    user_sessions[message.from_user.id] = {'step': 'awaiting_ai_prompt'}
-
-@dp.message_handler(lambda m: user_sessions.get(m.from_user.id, {}).get('step') == 'awaiting_ai_prompt')
-async def handle_ai_prompt(message: types.Message):
-    prompt = message.text.strip()
-    await message.reply("🔍 Думаю над вариантом...")
-    try:
-        result = ask_gpt(prompt)
-        await message.reply(f"🧠 Вот что я придумал:\n\n{result}")
-    except Exception as e:
-        await message.reply(f"Ошибка: {e}")
-    user_sessions.pop(message.from_user.id)
 
 @dp.message_handler(commands=['autodoc'])
 async def autodoc(message: types.Message):
@@ -157,30 +145,20 @@ async def handle_doc_request(message: types.Message):
 
     doc_type = data.pop("тип_документа")
     doc_path = generate_doc(doc_type, data, message.from_user.id)
-    sheet.append_row([message.from_user.id, doc_type, *data.values(), 'auto_generated'])
+    row = [str(message.from_user.id), doc_type] + [normalize(v) for v in data.values()] + ['auto']
+    sheet.append_row(row)
     await message.reply_document(open(doc_path, 'rb'))
     await message.reply("📄 Готово! Вот твой документ.")
     user_sessions.pop(message.from_user.id)
 
 def generate_doc(doc_type, data, user_id):
-    def normalize(value):
-        if isinstance(value, dict):
-            return "; ".join(f"{k}: {v}" for k, v in value.items())
-        elif isinstance(value, list):
-            return ", ".join(str(item) for item in value)
-        return str(value)
-
     with open(f'templates/{doc_type}.md', encoding='utf-8') as f:
         text = f.read()
-
     for key, value in data.items():
-        clean_value = normalize(value)
-        text = text.replace(f'{{{{{key}}}}}', clean_value)
-
+        text = text.replace(f'{{{{{key}}}}}', normalize(value))
     doc = Document()
     for line in text.split('\n'):
         doc.add_paragraph(line)
-
     output = f'/tmp/{user_id}_{doc_type}.docx'
     doc.save(output)
     return output
