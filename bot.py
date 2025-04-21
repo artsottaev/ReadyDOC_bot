@@ -32,7 +32,7 @@ user_sessions = {}
 doc_kb = ReplyKeyboardMarkup(resize_keyboard=True)
 doc_kb.add(KeyboardButton("NDA"), KeyboardButton("Акт"), KeyboardButton("Договор"))
 
-# GPT запрос
+# Запрос к GPT для обычной команды /smartdoc
 def ask_gpt(prompt_text):
     response = openai.ChatCompletion.create(
         model="gpt-3.5-turbo",
@@ -44,6 +44,30 @@ def ask_gpt(prompt_text):
         max_tokens=500
     )
     return response.choices[0].message["content"]
+
+# Запрос к GPT для автозаполнения шаблона
+def extract_doc_data(prompt_text):
+    system_prompt = (
+        "Ты юридический ассистент, помогаешь составить документ по шаблону. "
+        "Преобразуй описание в JSON с ключами: тип_документа (services, act, nda), "
+        "название_стороны, дата, номер_договора, сумма. Без комментариев и текста, только JSON."
+    )
+
+    completion = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt_text}
+        ],
+        temperature=0,
+        max_tokens=500
+    )
+
+    reply = completion.choices[0].message["content"]
+    try:
+        return json.loads(reply)
+    except json.JSONDecodeError:
+        return None
 
 @dp.message_handler(commands=['start'])
 async def start(message: types.Message):
@@ -114,6 +138,28 @@ async def handle_ai_prompt(message: types.Message):
         await message.reply(f"🧠 Вот что я придумал:\n\n{result}")
     except Exception as e:
         await message.reply(f"Ошибка: {e}")
+    user_sessions.pop(message.from_user.id)
+
+@dp.message_handler(commands=['autodoc'])
+async def autodoc(message: types.Message):
+    await message.reply("🧠 Опиши, какой документ тебе нужен.\nНапример:\n\"Договор оказания услуг между ООО и ИП, сумма 150 000, дата 10.05.2025\"")
+    user_sessions[message.from_user.id] = {'step': 'awaiting_doc_request'}
+
+@dp.message_handler(lambda m: user_sessions.get(m.from_user.id, {}).get('step') == 'awaiting_doc_request')
+async def handle_doc_request(message: types.Message):
+    await message.reply("🤖 Обрабатываю запрос...")
+    prompt = message.text.strip()
+    data = extract_doc_data(prompt)
+
+    if not data or not all(k in data for k in ['тип_документа', 'название_стороны', 'дата', 'номер_договора', 'сумма']):
+        await message.reply("😕 Не смог разобрать данные. Попробуй переформулировать запрос.")
+        return
+
+    doc_type = data.pop("тип_документа")
+    doc_path = generate_doc(doc_type, data, message.from_user.id)
+    sheet.append_row([message.from_user.id, doc_type, *data.values(), 'auto_generated'])
+    await message.reply_document(open(doc_path, 'rb'))
+    await message.reply("📄 Готово! Вот твой документ.")
     user_sessions.pop(message.from_user.id)
 
 def generate_doc(doc_type, data, user_id):
