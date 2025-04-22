@@ -18,8 +18,7 @@ openai.api_key = OPENAI_API_KEY
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher(bot)
 
-# Google Sheets setup
-scope = ['https://spreadsheets.google.com/feeds','https://www.googleapis.com/auth/drive']
+scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
 creds_dict = json.loads(os.getenv('GOOGLE_CREDS_JSON'))
 creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
 gs = gspread.authorize(creds)
@@ -27,7 +26,6 @@ sheet = gs.open('ReadyDoc MVP').sheet1
 
 user_sessions = {}
 
-# Удобное меню
 main_menu = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
 main_menu.add(
     KeyboardButton("✍️ Создать документ"),
@@ -76,7 +74,7 @@ def gpt_add_section(original_text, section_topic):
         max_tokens=300
     )
     addition = completion.choices[0].message["content"]
-    return original_text + "\\n\\n" + addition
+    return original_text + "\n\n" + addition
 
 def generate_doc(doc_type, data, user_id):
     with open(f'templates/{doc_type}.md', encoding='utf-8') as f:
@@ -84,7 +82,7 @@ def generate_doc(doc_type, data, user_id):
     for key, value in data.items():
         text = text.replace(f'{{{{{key}}}}}', normalize(value))
     doc = Document()
-    for line in text.split('\\n'):
+    for line in text.split('\n'):
         doc.add_paragraph(line)
     output = f'/tmp/{user_id}_{doc_type}.docx'
     doc.save(output)
@@ -144,7 +142,7 @@ async def handle_addition_input(message: types.Message):
     session['last_text'] = new_text
 
     doc = Document()
-    for line in new_text.split('\\n'):
+    for line in new_text.split('\n'):
         doc.add_paragraph(line)
     output = f'/tmp/{message.from_user.id}_final.docx'
     doc.save(output)
@@ -162,8 +160,3 @@ async def handle_done(call: types.CallbackQuery):
 
 if __name__ == "__main__":
     executor.start_polling(dp, skip_updates=True)
-"""
-
-# Сохраняем файл
-with open("/mnt/data/bot.py", "w", encoding="utf-8") as f:
-    f.write(updated_bot_code)
