@@ -4,7 +4,7 @@ import logging
 import asyncio
 import openai
 from aiogram import Bot, Dispatcher, types, executor
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from docx import Document
@@ -19,7 +19,7 @@ bot = Bot(token=API_TOKEN)
 dp = Dispatcher(bot)
 
 # Google Sheets setup
-scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+scope = ['https://spreadsheets.google.com/feeds','https://www.googleapis.com/auth/drive']
 creds_dict = json.loads(os.getenv('GOOGLE_CREDS_JSON'))
 creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
 gs = gspread.authorize(creds)
@@ -27,8 +27,14 @@ sheet = gs.open('ReadyDoc MVP').sheet1
 
 user_sessions = {}
 
-doc_kb = ReplyKeyboardMarkup(resize_keyboard=True)
-doc_kb.add(KeyboardButton("NDA"), KeyboardButton("Акт"), KeyboardButton("Договор"))
+# Удобное меню
+main_menu = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+main_menu.add(
+    KeyboardButton("✍️ Создать документ"),
+    KeyboardButton("⚙️ Настроить документ"),
+    KeyboardButton("🔁 Доработать"),
+    KeyboardButton("📄 Мои документы")
+)
 
 def normalize(value):
     if isinstance(value, dict):
@@ -37,25 +43,12 @@ def normalize(value):
         return ", ".join(str(item) for item in value)
     return str(value)
 
-def ask_gpt(prompt_text):
-    response = openai.ChatCompletion.create(
-        model="gpt-3.5-turbo",
-        messages=[
-            {"role": "system", "content": "Ты помощник по юридическим документам. Отвечай чётко и по делу."},
-            {"role": "user", "content": prompt_text}
-        ],
-        temperature=0.3,
-        max_tokens=500
-    )
-    return response.choices[0].message["content"]
-
 def extract_doc_data(prompt_text):
     system_prompt = (
-        "Ты юридический ассистент, помогаешь составить документ по шаблону. "
-        "Преобразуй описание в JSON с ключами: тип_документа (services, act, nda), "
-        "название_стороны, дата, номер_договора, сумма. Без комментариев и текста, только JSON."
+        "Ты юридический ассистент. Преобразуй описание в JSON с ключами: "
+        "тип_документа (services, act, nda), название_стороны, дата, номер_договора, сумма. "
+        "Без комментариев и лишнего текста. Только JSON."
     )
-
     completion = openai.ChatCompletion.create(
         model="gpt-3.5-turbo",
         messages=[
@@ -65,91 +58,25 @@ def extract_doc_data(prompt_text):
         temperature=0,
         max_tokens=500
     )
-
     reply = completion.choices[0].message["content"]
     try:
         return json.loads(reply)
     except json.JSONDecodeError:
         return None
 
-@dp.message_handler(commands=['start'])
-async def start(message: types.Message):
-    name = message.from_user.first_name or "друг"
-    await message.reply(f"Привет, {name}! Я — ReadyDoc. 🧠\n\nМогу подготовить NDA, акт или договор.\n\n🔹 /getdoc — ручное заполнение\n🔹 /autodoc — автогенерация с помощью ИИ")
-
-@dp.message_handler(commands=['getdoc'])
-async def getdoc(message: types.Message):
-    user_sessions[message.from_user.id] = {'step': 'choose_doc'}
-    await message.reply("Выбери документ, который тебе нужен:", reply_markup=doc_kb)
-
-@dp.message_handler(lambda m: user_sessions.get(m.from_user.id, {}).get('step') == 'choose_doc')
-async def choose_doc(message: types.Message):
-    doc_map = {
-        "NDA": "nda",
-        "Акт": "act",
-        "Договор": "services"
-    }
-    doc_choice = doc_map.get(message.text.strip())
-    if not doc_choice:
-        return await message.reply("Пожалуйста, выбери документ с кнопок ниже 👇", reply_markup=doc_kb)
-
-    user_sessions[message.from_user.id] = {
-        'step': 'collect',
-        'doc_type': doc_choice,
-        'data': {},
-        'fields': ['название_стороны', 'дата', 'номер_договора', 'сумма']
-    }
-    await message.reply("Отлично! Как называется твоя компания или имя исполнителя?")
-
-@dp.message_handler(lambda m: user_sessions.get(m.from_user.id, {}).get('step') == 'collect')
-async def collect_data(message: types.Message):
-    session = user_sessions[message.from_user.id]
-    data = session['data']
-    fields = session['fields']
-
-    current_field = fields[len(data)]
-    data[current_field] = message.text.strip()
-
-    if len(data) < len(fields):
-        next_field = fields[len(data)]
-        prompts = {
-            'дата': "Какая дата в документе?",
-            'номер_договора': "Какой номер у договора? (Если нет — напиши 'нет')",
-            'сумма': "На какую сумму составлен документ (₽)?"
-        }
-        await message.reply(prompts.get(next_field, f"Введите значение для {next_field}:"))
-    else:
-        await message.reply("Генерирую документ...")
-        await asyncio.sleep(1.5)
-        doc_path = generate_doc(session['doc_type'], data, message.from_user.id)
-        row = [str(message.from_user.id), session['doc_type']] + [normalize(v) for v in data.values()] + ['manual']
-        sheet.append_row(row)
-        await message.reply_document(open(doc_path, 'rb'))
-        await message.reply("✅ Готово! Хочешь ещё один документ? Жми /getdoc")
-        user_sessions.pop(message.from_user.id)
-
-@dp.message_handler(commands=['autodoc'])
-async def autodoc(message: types.Message):
-    await message.reply("🧠 Опиши, какой документ тебе нужен.\nНапример:\n\"Договор оказания услуг между ООО и ИП, сумма 150 000, дата 10.05.2025\"")
-    user_sessions[message.from_user.id] = {'step': 'awaiting_doc_request'}
-
-@dp.message_handler(lambda m: user_sessions.get(m.from_user.id, {}).get('step') == 'awaiting_doc_request')
-async def handle_doc_request(message: types.Message):
-    await message.reply("🤖 Обрабатываю запрос...")
-    prompt = message.text.strip()
-    data = extract_doc_data(prompt)
-
-    if not data or not all(k in data for k in ['тип_документа', 'название_стороны', 'дата', 'номер_договора', 'сумма']):
-        await message.reply("😕 Не смог разобрать данные. Попробуй переформулировать запрос.")
-        return
-
-    doc_type = data.pop("тип_документа")
-    doc_path = generate_doc(doc_type, data, message.from_user.id)
-    row = [str(message.from_user.id), doc_type] + [normalize(v) for v in data.values()] + ['auto']
-    sheet.append_row(row)
-    await message.reply_document(open(doc_path, 'rb'))
-    await message.reply("📄 Готово! Вот твой документ.")
-    user_sessions.pop(message.from_user.id)
+def gpt_add_section(original_text, section_topic):
+    prompt = f"Добавь в конец этого договора пункт о {section_topic} в официальном юридическом стиле. Документ:\n\n{original_text}"
+    completion = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo",
+        messages=[
+            {"role": "system", "content": "Ты юрист. Пиши только текст для вставки в договор."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.3,
+        max_tokens=300
+    )
+    addition = completion.choices[0].message["content"]
+    return original_text + "\\n\\n" + addition
 
 def generate_doc(doc_type, data, user_id):
     with open(f'templates/{doc_type}.md', encoding='utf-8') as f:
@@ -157,11 +84,86 @@ def generate_doc(doc_type, data, user_id):
     for key, value in data.items():
         text = text.replace(f'{{{{{key}}}}}', normalize(value))
     doc = Document()
-    for line in text.split('\n'):
+    for line in text.split('\\n'):
         doc.add_paragraph(line)
     output = f'/tmp/{user_id}_{doc_type}.docx'
     doc.save(output)
-    return output
+    return output, text
 
-if __name__ == '__main__':
+@dp.message_handler(commands=["start"])
+async def start(message: types.Message):
+    await message.reply("Привет! Я ReadyDoc. Выбери, что хочешь сделать 👇", reply_markup=main_menu)
+
+@dp.message_handler(lambda m: m.text == "✍️ Создать документ")
+async def create_doc(message: types.Message):
+    await message.reply("🧠 Опиши, какой документ тебе нужен.\nНапример: \"Договор оказания услуг между ООО и ИП, сумма 150 000, дата 10.05.2025\"")
+    user_sessions[message.from_user.id] = {'step': 'awaiting_doc_request'}
+
+@dp.message_handler(lambda m: user_sessions.get(m.from_user.id, {}).get('step') == 'awaiting_doc_request')
+async def handle_doc_request(message: types.Message):
+    prompt = message.text.strip()
+    await message.reply("🤖 Обрабатываю...")
+    data = extract_doc_data(prompt)
+
+    if not data or not all(k in data for k in ['тип_документа', 'название_стороны', 'дата', 'номер_договора', 'сумма']):
+        return await message.reply("😕 Не смог разобрать данные. Попробуй переформулировать.")
+
+    doc_type = data.pop("тип_документа")
+    path, raw_text = generate_doc(doc_type, data, message.from_user.id)
+
+    user_sessions[message.from_user.id] = {
+        'last_doc_type': doc_type,
+        'last_data': data,
+        'last_text': raw_text
+    }
+
+    row = [str(message.from_user.id), doc_type] + [normalize(v) for v in data.values()] + ['auto']
+    sheet.append_row(row)
+
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("➕ Добавить пункт", callback_data="add_section"),
+        InlineKeyboardButton("✅ Завершить", callback_data="done")
+    )
+
+    await message.reply_document(open(path, 'rb'), caption="📄 Документ готов. Что дальше?", reply_markup=markup)
+
+@dp.callback_query_handler(lambda c: c.data == "add_section")
+async def handle_addition_request(call: types.CallbackQuery):
+    await call.message.edit_reply_markup()
+    await call.message.answer("Что ты хочешь добавить? Например: ответственность, конфиденциальность, штрафы")
+    user_sessions[call.from_user.id]['step'] = 'awaiting_addition'
+
+@dp.message_handler(lambda m: user_sessions.get(m.from_user.id, {}).get('step') == 'awaiting_addition')
+async def handle_addition_input(message: types.Message):
+    section = message.text.strip()
+    session = user_sessions[message.from_user.id]
+    base_text = session['last_text']
+    new_text = gpt_add_section(base_text, section)
+
+    session['last_text'] = new_text
+
+    doc = Document()
+    for line in new_text.split('\\n'):
+        doc.add_paragraph(line)
+    output = f'/tmp/{message.from_user.id}_final.docx'
+    doc.save(output)
+
+    await message.reply_document(open(output, 'rb'), caption="📄 Готово! Пункт добавлен.")
+    await message.reply("Хочешь что-то ещё изменить или закончить?", reply_markup=InlineKeyboardMarkup().add(
+        InlineKeyboardButton("➕ Добавить ещё", callback_data="add_section"),
+        InlineKeyboardButton("✅ Завершить", callback_data="done")
+    ))
+
+@dp.callback_query_handler(lambda c: c.data == "done")
+async def handle_done(call: types.CallbackQuery):
+    await call.message.edit_reply_markup()
+    await call.message.answer("✅ Готово. Документ сохранён. Чтобы начать заново — нажми «Создать документ»", reply_markup=main_menu)
+
+if __name__ == "__main__":
     executor.start_polling(dp, skip_updates=True)
+"""
+
+# Сохраняем файл
+with open("/mnt/data/bot.py", "w", encoding="utf-8") as f:
+    f.write(updated_bot_code)
