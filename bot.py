@@ -8,6 +8,9 @@ from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMar
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from docx import Document
+from utils.docgen import generate_doc, normalize
+from utils.gpt import extract_doc_data, gpt_add_section
+from utils.sheets import save_row
 
 logging.basicConfig(level=logging.INFO)
 
