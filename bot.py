@@ -63,8 +63,7 @@ async def handle_description(message: types.Message):
     await message.reply_document(open(doc_path, "rb"), caption="📄 Документ готов.")
 
     check_result = legal_self_check(text)
-    await message.reply(f"⚖️ Юридическая проверка:
-{check_result}")
+    await message.reply(f"⚖️ Юридическая проверка:\n{check_result}")
 
     user_sessions.pop(user_id, None)
 
@@ -74,18 +73,17 @@ async def handle_clarification(message: types.Message):
     original = user_sessions[user_id].get("original_prompt", "")
     combined_prompt = f"{original}. Дополнение: {message.text.strip()}"
 
-    await message.reply("🔄 Обрабатываю дополненную информацию...")
+    await message.reply("🔄 Обрабатываю дополнённую информацию...")
 
-    text = generate_full_contract(combined_prompt)
-    save_to_cache(combined_prompt, text)
+    try:
+        text = generate_full_contract(combined_prompt)
+        save_to_cache(combined_prompt, text)
 
-    doc_path = generate_doc_from_text(text, user_id)
-    await message.reply_document(open(doc_path, "rb"), caption="📄 Документ готов.")
+        doc_path = generate_doc_from_text(text, user_id)
+        await message.reply_document(open(doc_path, "rb"), caption="📄 Документ готов.")
 
-    check_result = legal_self_check(text)
-    await message.reply(f"⚖️ Юридическая проверка:
-{check_result}")
-
+        check_result = legal_self_check(text)
+        await message.reply(f"⚖️ Юридическая проверка:\n{check_result}")
     except Exception as e:
         logging.error(f"Ошибка генерации: {e}")
         await message.reply("⚠️ Что-то пошло не так. Попробуй снова или измени описание.")
