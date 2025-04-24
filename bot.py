@@ -52,8 +52,7 @@ async def handle_description(message: types.Message):
     else:
         followup = ask_for_missing_data(prompt)
         if "?" in followup:
-            await message.reply(f"🤔 Пожалуйста, уточни:
-{followup}")
+            await message.reply(f"🤔 Пожалуйста, уточни:\n{followup}")
             user_sessions[user_id] = {"step": "awaiting_clarification", "original_prompt": prompt}
             return
         else:
