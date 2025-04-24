@@ -44,7 +44,7 @@ async def handle_description(message: types.Message):
     prompt = message.text.strip()
     user_sessions[user_id]["step"] = "processing"
 
-    await message.reply("🔍 Проверяю, можно ли составить документ…»)
+    await message.reply("🔍 Проверяю, можно ли составить документ…")
 
     if cache_exists(prompt):
         text = load_from_cache(prompt)
