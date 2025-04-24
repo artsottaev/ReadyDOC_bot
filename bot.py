@@ -1,4 +1,3 @@
-
 import os
 import logging
 from aiogram import Bot, Dispatcher, types, executor
@@ -31,7 +30,7 @@ async def start(message: types.Message):
 
 @dp.message_handler(lambda m: m.text == "✍️ Создать документ")
 async def create_document(message: types.Message):
-    await message.reply("📝 Опиши, какой договор документ:»)
+    await message.reply("📝 Опиши, какой документ нужен:")
     user_sessions[message.from_user.id] = {"step": "awaiting_description"}
 
 @dp.message_handler(lambda m: m.text == "❌ Отмена")
