@@ -1,8 +1,9 @@
+
 import os
 import logging
 from aiogram import Bot, Dispatcher, types, executor
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
-from utils.gpt_text_gen import ask_for_missing_data, generate_full_contract, legal_self_check
+from utils.gpt_text_gen import extract_followup_questions, generate_full_contract, legal_self_check_and_extend
 from utils.docgen import generate_doc_from_text
 from utils.cache_manager import cache_exists, load_from_cache, save_to_cache
 
@@ -22,10 +23,7 @@ user_sessions = {}
 
 @dp.message_handler(commands=["start"])
 async def start(message: types.Message):
-    await message.reply(
-        "Привет! Я ReadyDoc — бот, который генерирует готовые юридические документы. Опиши, что тебе нужно 👇",
-        reply_markup=main_menu
-    )
+    await message.reply("Привет! Я ReadyDoc. Опиши, какой договор тебе нужен.", reply_markup=main_menu)
     user_sessions[message.from_user.id] = {"step": "awaiting_description"}
 
 @dp.message_handler(lambda m: m.text == "✍️ Создать документ")
@@ -42,53 +40,36 @@ async def cancel(message: types.Message):
 async def handle_description(message: types.Message):
     user_id = message.from_user.id
     prompt = message.text.strip()
-    user_sessions[user_id]["step"] = "processing"
+    user_sessions[user_id] = {
+        "step": "asking_followups",
+        "prompt": prompt,
+        "answers": [],
+        "questions": extract_followup_questions(prompt)
+    }
+    await ask_next_question(message, user_id)
 
-    await message.reply("🔍 Проверяю, можно ли составить документ…")
-
-    if cache_exists(prompt):
-        text = load_from_cache(prompt)
-        await message.reply("📦 Нашёл похожий запрос")
+async def ask_next_question(message, user_id):
+    session = user_sessions[user_id]
+    questions = session["questions"]
+    answers = session["answers"]
+    if len(answers) < len(questions):
+        await message.reply(f"❓ {questions[len(answers)]}")
     else:
-        followup = ask_for_missing_data(prompt)
-        if "?" in followup:
-            await message.reply(f"🤔 Пожалуйста, уточни:\n{followup}")
-            user_sessions[user_id] = {"step": "awaiting_clarification", "original_prompt": prompt}
-            return
-        else:
-            text = generate_full_contract(prompt)
-            save_to_cache(prompt, text)
-
-    doc_path = generate_doc_from_text(text, user_id)
-    await message.reply_document(open(doc_path, "rb"), caption="📄 Документ готов.")
-
-    check_result = legal_self_check(text)
-    await message.reply(f"⚖️ Юридическая проверка:\n{check_result}")
-
-    user_sessions.pop(user_id, None)
-
-@dp.message_handler(lambda m: user_sessions.get(m.from_user.id, {}).get("step") == "awaiting_clarification")
-async def handle_clarification(message: types.Message):
-    user_id = message.from_user.id
-    original = user_sessions[user_id].get("original_prompt", "")
-    combined_prompt = f"{original}. Дополнение: {message.text.strip()}"
-
-    await message.reply("🔄 Обрабатываю дополнённую информацию...")
-
-    try:
-        text = generate_full_contract(combined_prompt)
-        save_to_cache(combined_prompt, text)
-
+        full_prompt = session["prompt"] + "\n" + "\n".join(answers)
+        await message.reply("📄 Генерирую договор на основе твоих ответов...")
+        text = generate_full_contract(full_prompt)
+        text = legal_self_check_and_extend(text)
+        save_to_cache(full_prompt, text)
         doc_path = generate_doc_from_text(text, user_id)
-        await message.reply_document(open(doc_path, "rb"), caption="📄 Документ готов.")
+        await message.reply_document(open(doc_path, "rb"), caption="✅ Готово! Документ составлен.")
+        user_sessions.pop(user_id, None)
 
-        check_result = legal_self_check(text)
-        await message.reply(f"⚖️ Юридическая проверка:\n{check_result}")
-    except Exception as e:
-        logging.error(f"Ошибка генерации: {e}")
-        await message.reply("⚠️ Что-то пошло не так. Попробуй снова или измени описание.")
-
-    user_sessions.pop(user_id, None)
+@dp.message_handler(lambda m: user_sessions.get(m.from_user.id, {}).get("step") == "asking_followups")
+async def handle_followup_answer(message: types.Message):
+    user_id = message.from_user.id
+    session = user_sessions[user_id]
+    session["answers"].append(message.text.strip())
+    await ask_next_question(message, user_id)
 
 if __name__ == "__main__":
     executor.start_polling(dp, skip_updates=True)
