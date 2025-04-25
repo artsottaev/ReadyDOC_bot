@@ -37,6 +37,20 @@ def generate_full_contract(prompt_text):
     )
     return completion.choices[0].message["content"]
 
+def ask_for_missing_data(prompt_text):
+    clarification_prompt = (
+        "Ты юрист. Получен неполный запрос клиента:\n"
+        f"{prompt_text}\n\n"
+        "Какие 2-3 вопроса ты бы задал, чтобы можно было составить корректный юридический договор?"
+    )
+    completion = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo",
+        messages=[{"role": "user", "content": clarification_prompt}],
+        temperature=0.3,
+        max_tokens=300
+    )
+    return completion.choices[0].message["content"]
+
 def legal_self_check_and_extend(doc_text):
     check_and_extend_prompt = (
         "Ты — опытный юрист. Прочитай договор ниже, оцени соответствие законодательству РФ и ДОПОЛНИ его, "
