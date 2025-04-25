@@ -55,8 +55,13 @@ async def ask_next_question(message, user_id):
     if len(answers) < len(questions):
         await message.reply(f"❓ {questions[len(answers)]}")
     else:
-        full_prompt = session["prompt"] + "\n" + "\n".join(answers)
-        await message.reply("📄 Генерирую договор на основе твоих ответов...")
+        full_prompt = (
+    "Составь полный юридический договор, соответствующий законодательству РФ на 2025 год."
+    "Используй следующую информацию от клиента:\n\n"
+    f"Описание: {session['prompt']}\n"
+    f"Дополнительно:\n" + "\n".join(session["answers"])
+)       
+	await message.reply("📄 Генерирую договор на основе твоих ответов...")
         text = generate_full_contract(full_prompt)
         text = legal_self_check_and_extend(text)
         save_to_cache(full_prompt, text)
