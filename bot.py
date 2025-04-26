@@ -53,7 +53,7 @@ async def collect_clarification(message: Message, state: FSMContext):
 
 # Шаг 3: Генерация документа
 async def generate_draft(message: Message):
-    user_data = await message.answer()  # Заменено на правильный вызов состояния
+    user_data = await dp.storage.get_data(message.from_user.id)
 
     # Пример генерации документа (замени на реальную логику)
     document_text = f"Документ для компании {user_data.get('company_name')}."
