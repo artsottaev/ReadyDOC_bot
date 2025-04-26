@@ -31,16 +31,16 @@ async def collect_data(message: Message, state: FSMContext):
     user_data["company_name"] = message.text  # Просто пример
     await state.update_data(user_data)
 
-    # Переход к уточнению данных, только если нужно
-    await message.answer("Всё верно? Если нужно что-то уточнить, просто напишите.")
-    await state.set_state(ReadyDocFSM.clarifying_data)  # Устанавливаем состояние уточнения
+    # Переход к уточнению данных
+    await message.answer(TEXT_CLARIFYING)
+    await state.set_state(ReadyDocFSM.clarifying_data)
 
 # Шаг 2: Уточнение данных
 @dp.message(ReadyDocFSM.clarifying_data)
 async def collect_clarification(message: Message, state: FSMContext):
     user_data = await state.get_data()
-    
-    # Пример уточнения
+
+    # Пример уточнения (если нужно)
     if message.text:
         user_data["clarified_info"] = message.text
         await state.update_data(user_data)
