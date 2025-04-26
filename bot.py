@@ -31,24 +31,23 @@ async def collect_data(message: Message, state: FSMContext):
     user_data["company_name"] = message.text  # Просто пример
     await state.update_data(user_data)
 
-    # Переход к уточнению данных
-    await message.answer(TEXT_CLARIFYING)
-    await collect_clarification(message)
+    # Переход к уточнению данных, только если нужно
+    await message.answer("Всё верно? Если нужно что-то уточнить, просто напишите.")
+    await state.set_state(ReadyDocFSM.clarifying_data)  # Устанавливаем состояние уточнения
 
 # Шаг 2: Уточнение данных
-async def collect_clarification(message: Message):
-    user_data = await dp.storage.get_data(message.from_user.id)
-
-    # Пример уточнения (если нужно)
-    clarification_question = "Уточните, пожалуйста, информацию."
-    await message.answer(clarification_question)
-
-    # Логика уточнения
-    if message.text:  # Если есть ответ
+@dp.message(ReadyDocFSM.clarifying_data)
+async def collect_clarification(message: Message, state: FSMContext):
+    user_data = await state.get_data()
+    
+    # Пример уточнения
+    if message.text:
         user_data["clarified_info"] = message.text
+        await state.update_data(user_data)
 
-    # Переход к генерации черновика
-    await message.answer("Генерируем черновик...")
+    # Переход к генерации документа
+    await message.answer("Генерируем черновик документа...")
+    await state.set_state(ReadyDocFSM.generating_draft)
     await generate_draft(message)
 
 # Шаг 3: Генерация документа
