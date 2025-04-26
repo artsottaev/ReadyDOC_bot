@@ -4,6 +4,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import Message
 from aiogram import F
 from aiogram.fsm.context import FSMContext
+from aiogram.filters.state import StateFilter
 from utils.settings import BOT_TOKEN
 from utils.prompts import TEXT_COLLECTING, TEXT_CLARIFYING
 
@@ -36,7 +37,7 @@ async def collect_data(message: Message, state: FSMContext):
     await state.set_state(ReadyDocFSM.clarifying_data)
 
 # Шаг 2: Уточнение данных
-@dp.message(ReadyDocFSM.clarifying_data)  # Применяем фильтр по состоянию
+@dp.message(StateFilter(ReadyDocFSM.clarifying_data))  # Используем StateFilter
 async def collect_clarification(message: Message, state: FSMContext):
     user_data = await state.get_data()
 
@@ -52,7 +53,7 @@ async def collect_clarification(message: Message, state: FSMContext):
 
 # Шаг 3: Генерация документа
 async def generate_draft(message: Message):
-    user_data = await dp.storage.get_data(message.from_user.id)
+    user_data = await message.answer()  # Заменено на правильный вызов состояния
 
     # Пример генерации документа (замени на реальную логику)
     document_text = f"Документ для компании {user_data.get('company_name')}."
