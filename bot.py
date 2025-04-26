@@ -1,10 +1,10 @@
+
 import os
 import logging
 from aiogram import Bot, Dispatcher, types, executor
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
-from utils.gpt_text_gen import ask_for_missing_data, generate_full_contract, legal_self_check
+from utils.gpt_text_gen import ask_question, generate_full_contract, legal_self_check
 from utils.docgen import generate_doc_from_text
-from utils.cache_manager import cache_exists, load_from_cache, save_to_cache
 
 logging.basicConfig(level=logging.INFO)
 
@@ -12,83 +12,69 @@ API_TOKEN = os.getenv("API_TOKEN")
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher(bot)
 
-main_menu = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-main_menu.add(
-    KeyboardButton("✍️ Создать документ"),
-    KeyboardButton("❌ Отмена")
-)
+main_menu = ReplyKeyboardMarkup(resize_keyboard=True)
+main_menu.add(KeyboardButton("📄 Новый документ"))
 
-user_sessions = {}
+user_data = {}
 
 @dp.message_handler(commands=["start"])
 async def start(message: types.Message):
-    await message.reply(
-        "Привет! Я ReadyDoc — бот, который генерирует готовые юридические документы. Опиши, что тебе нужно 👇",
-        reply_markup=main_menu
-    )
-    user_sessions[message.from_user.id] = {"step": "awaiting_description"}
+    user_data[message.from_user.id] = {"step": "awaiting_type", "context": ""}
+    await message.reply("Привет! Какой документ тебе нужен?", reply_markup=main_menu)
 
-@dp.message_handler(lambda m: m.text == "✍️ Создать документ")
-async def create_document(message: types.Message):
-    await message.reply("📝 Опиши, какой документ нужен:")
-    user_sessions[message.from_user.id] = {"step": "awaiting_description"}
+@dp.message_handler(lambda m: m.text == "📄 Новый документ")
+async def new_doc(message: types.Message):
+    user_data[message.from_user.id] = {"step": "awaiting_type", "context": ""}
+    await message.reply("📝 Какой документ нужен? Например: договор подряда, NDA, аренды…")
 
-@dp.message_handler(lambda m: m.text == "❌ Отмена")
-async def cancel(message: types.Message):
-    user_sessions.pop(message.from_user.id, None)
-    await message.reply("Ок! Если нужно — нажми «Создать документ»", reply_markup=main_menu)
+@dp.message_handler()
+async def handle_input(message: types.Message):
+    uid = message.from_user.id
+    if uid not in user_data:
+        user_data[uid] = {"step": "awaiting_type", "context": ""}
 
-@dp.message_handler(lambda m: user_sessions.get(m.from_user.id, {}).get("step") == "awaiting_description")
-async def handle_description(message: types.Message):
-    user_id = message.from_user.id
-    prompt = message.text.strip()
-    user_sessions[user_id]["step"] = "processing"
+    session = user_data[uid]
+    step = session["step"]
+    context = session["context"]
 
-    await message.reply("🔍 Проверяю, можно ли составить документ…")
+    if step == "awaiting_type":
+        session["context"] = message.text.strip()
+        session["step"] = "clarifying"
+        question = ask_question(session["context"])
+        await message.reply(f"❓ {question}")
+        return
 
-    if cache_exists(prompt):
-        text = load_from_cache(prompt)
-        await message.reply("📦 Нашёл похожий запрос")
-    else:
-        followup = ask_for_missing_data(prompt)
-        if "?" in followup:
-            await message.reply(f"🤔 Пожалуйста, уточни:\n{followup}")
-            user_sessions[user_id] = {"step": "awaiting_clarification", "original_prompt": prompt}
-            return
+    elif step == "clarifying":
+        session["context"] += f"\nДополнение: {message.text.strip()}"
+        question = ask_question(session["context"])
+        if "?" in question:
+            await message.reply(f"❓ {question}")
         else:
-            text = generate_full_contract(prompt)
-            save_to_cache(prompt, text)
+            session["step"] = "generating"
+            await message.reply("📄 Генерирую договор…")
+            text = generate_full_contract(session["context"])
+            session["contract"] = text
+            await message.reply("🔎 Проверяю соответствие закону…")
+            review = legal_self_check(text)
+            session["review"] = review
+            if "корректен" in review.lower():
+                session["step"] = "ready"
+                path = generate_doc_from_text(text, uid)
+                await message.reply_document(open(path, "rb"), caption="✅ Готово! Документ соответствует закону.")
+            else:
+                session["step"] = "ask_fix"
+                await message.reply(f"⚠️ Найдены риски:\n{review}\n\nХотите, чтобы я исправил документ? (да/нет)")
 
-    doc_path = generate_doc_from_text(text, user_id)
-    await message.reply_document(open(doc_path, "rb"), caption="📄 Документ готов.")
-
-    check_result = legal_self_check(text)
-    await message.reply(f"⚖️ Юридическая проверка:\n{check_result}")
-
-    user_sessions.pop(user_id, None)
-
-@dp.message_handler(lambda m: user_sessions.get(m.from_user.id, {}).get("step") == "awaiting_clarification")
-async def handle_clarification(message: types.Message):
-    user_id = message.from_user.id
-    original = user_sessions[user_id].get("original_prompt", "")
-    combined_prompt = f"{original}. Дополнение: {message.text.strip()}"
-
-    await message.reply("🔄 Обрабатываю дополнённую информацию...")
-
-    try:
-        text = generate_full_contract(combined_prompt)
-        save_to_cache(combined_prompt, text)
-
-        doc_path = generate_doc_from_text(text, user_id)
-        await message.reply_document(open(doc_path, "rb"), caption="📄 Документ готов.")
-
-        check_result = legal_self_check(text)
-        await message.reply(f"⚖️ Юридическая проверка:\n{check_result}")
-    except Exception as e:
-        logging.error(f"Ошибка генерации: {e}")
-        await message.reply("⚠️ Что-то пошло не так. Попробуй снова или измени описание.")
-
-    user_sessions.pop(user_id, None)
+    elif step == "ask_fix":
+        if message.text.lower() in ["да", "исправь", "давай"]:
+            session["context"] += "\nПросьба: исправь риски и приведи в соответствие с законом"
+            fixed = generate_full_contract(session["context"])
+            path = generate_doc_from_text(fixed, uid)
+            await message.reply_document(open(path, "rb"), caption="✅ Документ исправлен и готов.")
+        else:
+            path = generate_doc_from_text(session["contract"], uid)
+            await message.reply_document(open(path, "rb"), caption="📎 Документ с замечаниями.")
+        user_data.pop(uid)
 
 if __name__ == "__main__":
     executor.start_polling(dp, skip_updates=True)
