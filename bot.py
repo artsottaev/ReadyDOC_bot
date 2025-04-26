@@ -36,7 +36,7 @@ async def collect_data(message: Message, state: FSMContext):
     await state.set_state(ReadyDocFSM.clarifying_data)
 
 # Шаг 2: Уточнение данных
-@dp.message(ReadyDocFSM.clarifying_data)
+@dp.message(ReadyDocFSM.clarifying_data)  # Применяем фильтр по состоянию
 async def collect_clarification(message: Message, state: FSMContext):
     user_data = await state.get_data()
 
