@@ -1,10 +1,13 @@
-
 from docx import Document
 
-def generate_doc_from_text(text, user_id):
+# Функция для генерации .docx документа
+async def generate_docx(document_text: str):
     doc = Document()
-    for line in text.split('\n'):
-        doc.add_paragraph(line)
-    path = f"/tmp/final_contract_{user_id}.docx"
-    doc.save(path)
-    return path
+    doc.add_heading('Юридический документ', 0)
+    doc.add_paragraph(document_text)
+
+    # Сохранение документа во временный файл
+    temp_file_path = "/tmp/document.docx"
+    doc.save(temp_file_path)
+    
+    return temp_file_path

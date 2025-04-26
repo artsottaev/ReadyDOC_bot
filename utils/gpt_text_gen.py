@@ -1,52 +1,30 @@
-import os
-from openai import OpenAI
+import openai
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# Настройки для взаимодействия с OpenAI
+openai.api_key = 'your_openai_api_key'
 
-def ask_question(prompt_text):
-    system_prompt = (
-        "Ты — российский юрист. Сформулируй ОДИН конкретный вопрос к клиенту, чтобы составить договор "
-        "максимально точно и без лишнего. Не задавай больше одного вопроса за раз."
-    )
-    response = client.chat.completions.create(
+# Функция для генерации текста документа
+async def gpt_generate_text(user_data):
+    # Параметры для запроса в OpenAI
+    prompt = f"Генерируй юридический документ для компании {user_data['company_name']}. Юридический адрес: {user_data.get('clarified_info', 'не указан')}. Согласно законодательству РФ на 2025 год."
+    
+    # Отправка запроса к OpenAI
+    response = openai.Completion.create(
         model="gpt-3.5-turbo",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": prompt_text}
-        ],
-        temperature=0.3,
-        max_tokens=150
+        prompt=prompt,
+        max_tokens=1500,
+        temperature=0.5
     )
-    return response.choices[0].message.content
+    
+    return response['choices'][0]['text'].strip()
 
-def generate_full_contract(prompt_text):
-    system_prompt = (
-        "Ты — опытный российский юрист. Составь ПОЛНЫЙ текст договора на основании данных клиента. "
-        "Соблюдай актуальное законодательство РФ (2025 год). Включай: преамбулу, предмет, срок, обязанности сторон, "
-        "ответственность, оплату, расторжение, подписи. Стиль — официальный. Только текст договора."
-    )
-    response = client.chat.completions.create(
-        model="gpt-3.5-turbo",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": prompt_text}
-        ],
-        temperature=0.2,
-        max_tokens=1800
-    )
-    return response.choices[0].message.content
+# Функция для проверки недостающих данных в документе
+async def gpt_check_missing_data(document_text):
+    # Пример проверки: если в тексте нет обязательных элементов, возвращаем это
+    missing_data = []
+    
+    if "необходимо" not in document_text:
+        missing_data.append("Отсутствует важная фраза 'необходимо'.")
+    
+    return missing_data
 
-def legal_self_check(doc_text):
-    check_prompt = (
-        "Проанализируй юридический текст ниже: выяви риски, устаревшие формулировки и нарушения законодательства РФ. "
-        "Если всё хорошо — ответь кратко, что документ корректен. Текст:\n\n" + doc_text
-    )
-    response = client.chat.completions.create(
-        model="gpt-3.5-turbo",
-        messages=[
-            {"role": "user", "content": check_prompt}
-        ],
-        temperature=0.2,
-        max_tokens=600
-    )
-    return response.choices[0].message.content

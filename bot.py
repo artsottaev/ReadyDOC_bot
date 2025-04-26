@@ -1,90 +1,107 @@
-import os
 import asyncio
 import logging
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.enums import ParseMode
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
-from aiogram.client.default import DefaultBotProperties
 
-from utils.gpt_text_gen import ask_question, generate_full_contract, legal_self_check
-from utils.docgen import generate_doc_from_text
+from aiogram import Bot, Dispatcher
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import Message
+
+from utils.settings import BOT_TOKEN
+from utils.prompts import *
+from utils.gpt_text_gen import gpt_generate_text, gpt_check_missing_data
+from utils.legal_checker import check_document_legality
+from utils.docgen import generate_docx
 
 logging.basicConfig(level=logging.INFO)
 
-API_TOKEN = os.getenv("API_TOKEN")
+# Инициализация бота и диспетчера
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
 
-bot = Bot(token=API_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-dp = Dispatcher()
+# Состояния FSM
+class ReadyDocFSM:
+    collecting_data = "collecting_data"
+    clarifying_data = "clarifying_data"
+    generating_draft = "generating_draft"
+    legal_check = "legal_check"
+    finalizing_document = "finalizing_document"
+    sending_result = "sending_result"
 
-main_menu = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="📄 Новый документ")]
-    ],
-    resize_keyboard=True
-)
+# Шаг 1: Сбор данных
+async def collect_data(message: Message):
+    # Пример: собираем название компании
+    await message.answer(TEXT_COLLECTING)
+    user_data = await dp.storage.get_data(message.from_user.id)
+    
+    # Здесь логика для сбора данных (например, название компании)
+    user_data["company_name"] = message.text  # Просто пример
+    await dp.storage.set_data(message.from_user.id, user_data)
 
-user_data = {}
+    # Переход к уточнению данных
+    await message.answer(TEXT_CLARIFYING)
+    await collect_clarification(message)
 
-@dp.message(F.text == "/start")
-async def start(message: Message):
-    user_data[message.from_user.id] = {"step": "awaiting_type", "context": ""}
-    await message.answer("Привет! Какой документ тебе нужен?", reply_markup=main_menu)
+# Шаг 2: Уточнение данных
+async def collect_clarification(message: Message):
+    user_data = await dp.storage.get_data(message.from_user.id)
 
-@dp.message(F.text == "📄 Новый документ")
-async def new_doc(message: Message):
-    user_data[message.from_user.id] = {"step": "awaiting_type", "context": ""}
-    await message.answer("📝 Какой документ нужен? Например: договор подряда, NDA, аренды…")
+    # Пример уточнения (если нужно)
+    clarification_question = TEXT_CLARIFICATION
+    await message.answer(clarification_question)
 
-@dp.message(F.text)
-async def handle_input(message: Message):
-    uid = message.from_user.id
-    if uid not in user_data:
-        user_data[uid] = {"step": "awaiting_type", "context": ""}
+    # Здесь логика уточнения
+    if message.text:  # Если есть ответ
+        user_data["clarified_info"] = message.text
 
-    session = user_data[uid]
-    step = session["step"]
-    context = session["context"]
+    # Переход к генерации черновика
+    await message.answer(TEXT_GENERATING)
+    await generate_draft(message)
 
-    if step == "awaiting_type":
-        session["context"] = message.text.strip()
-        session["step"] = "clarifying"
-        question = ask_question(session["context"])
-        await message.answer(f"❓ {question}")
-        return
+# Шаг 3: Генерация документа
+async def generate_draft(message: Message):
+    user_data = await dp.storage.get_data(message.from_user.id)
 
-    elif step == "clarifying":
-        session["context"] += f"\nДополнение: {message.text.strip()}"
-        question = ask_question(session["context"])
-        if "?" in question:
-            await message.answer(f"❓ {question}")
-        else:
-            session["step"] = "generating"
-            await message.answer("📄 Генерирую договор…")
-            text = generate_full_contract(session["context"])
-            session["contract"] = text
-            await message.answer("🔎 Проверяю соответствие закону…")
-            review = legal_self_check(text)
-            session["review"] = review
-            if "корректен" in review.lower():
-                session["step"] = "ready"
-                path = generate_doc_from_text(text, uid)
-                await message.answer_document(open(path, "rb"), caption="✅ Готово! Документ соответствует закону.")
-            else:
-                session["step"] = "ask_fix"
-                await message.answer(f"⚠️ Найдены риски:\n{review}\n\nХотите, чтобы я исправил документ? (да/нет)")
+    # Генерация текста документа через GPT
+    document_text = await gpt_generate_text(user_data)
 
-    elif step == "ask_fix":
-        if message.text.lower() in ["да", "исправь", "давай"]:
-            session["context"] += "\nПросьба: исправь риски и приведи в соответствие с законом"
-            fixed = generate_full_contract(session["context"])
-            path = generate_doc_from_text(fixed, uid)
-            await message.answer_document(open(path, "rb"), caption="✅ Документ исправлен и готов.")
-        else:
-            path = generate_doc_from_text(session["contract"], uid)
-            await message.answer_document(open(path, "rb"), caption="📎 Документ с замечаниями.")
-        user_data.pop(uid)
+    # Переход к юридической проверке
+    await message.answer(TEXT_CHECKING_LEGALITY)
+    await legal_check(message, document_text)
+
+# Шаг 4: Юридическая проверка
+async def legal_check(message: Message, document_text: str):
+    legal_issues = await check_document_legality(document_text)
+
+    if legal_issues:
+        # Если есть проблемы, отправляем уведомление
+        await message.answer(TEXT_LEGAL_ISSUES.format(issues=legal_issues))
+        await message.answer(TEXT_FIX_ISSUES)
+        await fix_issues(message)
+    else:
+        # Если всё в порядке, финализируем документ
+        await message.answer(TEXT_DOCUMENT_OK)
+        await finalize_document(message, document_text)
+
+# Шаг 5: Исправление проблем
+async def fix_issues(message: Message):
+    # Логика исправления (если нужно)
+    await message.answer(TEXT_FIXING)
+    await generate_draft(message)  # Повторная генерация с исправлениями
+
+# Шаг 6: Финализация и отправка документа
+async def finalize_document(message: Message, document_text: str):
+    # Генерация .docx файла
+    doc_file = await generate_docx(document_text)
+
+    # Отправка документа пользователю
+    await message.answer(TEXT_DOCUMENT_READY)
+    await message.answer_document(doc_file)
+    
+    # Завершаем процесс
+    await message.answer(TEXT_THANKS)
 
 async def main():
+    # Основной цикл
+    dp.message_handler(lambda message: True)(collect_data)  # Пример для начала
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
