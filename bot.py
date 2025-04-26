@@ -10,10 +10,13 @@ from utils.gpt_text_gen import gpt_generate_text, gpt_check_missing_data
 from utils.legal_checker import check_document_legality
 from utils.docgen import generate_docx
 
-from dotenv import load_dotenv  # <-- ДОБАВЛЕНО
+from dotenv import load_dotenv
+import os
 
-# Загрузка переменных окружения
-load_dotenv()  # <-- ДОБАВЛЕНО
+# Загружаем переменные окружения из .env
+load_dotenv()
+
+BOT_TOKEN = os.getenv('BOT_TOKEN')
 
 logging.basicConfig(level=logging.INFO)
 
