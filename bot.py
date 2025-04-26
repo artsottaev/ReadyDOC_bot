@@ -1,26 +1,18 @@
 import asyncio
 import logging
+
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import Message
 
 from utils.settings import BOT_TOKEN
 from utils.prompts import *
-from utils.gpt_text_gen import gpt_generate_text, gpt_check_missing_data
+from utils.gpt_text_gen import gpt_generate_text
 from utils.legal_checker import check_document_legality
 from utils.docgen import generate_docx
 
-from dotenv import load_dotenv
-import os
-
-# Загружаем переменные окружения из .env
-load_dotenv()
-
-BOT_TOKEN = os.getenv('BOT_TOKEN')
-
 logging.basicConfig(level=logging.INFO)
 
-# Инициализация бота и диспетчера
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
