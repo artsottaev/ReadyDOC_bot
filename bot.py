@@ -1,105 +1,69 @@
+import os
 import logging
-from aiogram import Bot, Dispatcher, types
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import Message
-from aiogram import F
-from aiogram.fsm.context import FSMContext
-from aiogram.filters.state import StateFilter
-from utils.settings import BOT_TOKEN
-from utils.prompts import TEXT_COLLECTING, TEXT_CLARIFYING
+from aiogram import Bot, Dispatcher, types, executor
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+from docx import Document
+from utils.gpt_text_gen import generate_full_contract
+from utils.docgen import generate_doc, normalize
+from utils.gpt import extract_doc_data, gpt_add_section
+from utils.sheets import save_row
 
-# Инициализация бота и диспетчера
 logging.basicConfig(level=logging.INFO)
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(storage=MemoryStorage())
 
-# Состояния FSM
-class ReadyDocFSM:
-    collecting_data = "collecting_data"
-    clarifying_data = "clarifying_data"
-    generating_draft = "generating_draft"
-    legal_check = "legal_check"
-    finalizing_document = "finalizing_document"
-    sending_result = "sending_result"
+API_TOKEN = os.getenv("API_TOKEN")
+bot = Bot(token=API_TOKEN)
+dp = Dispatcher(bot)
 
-# Шаг 1: Сбор данных
-@dp.message(F.text)
-async def collect_data(message: Message, state: FSMContext):
-    await message.answer(TEXT_COLLECTING)
-    user_data = await state.get_data()
+# Главное меню
+main_menu = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+main_menu.add(
+    KeyboardButton("✍️ Создать документ"),
+    KeyboardButton("❌ Отмена")
+)
 
-    # Пример: собираем название компании
-    user_data["company_name"] = message.text  # Просто пример
-    await state.update_data(user_data)
+user_sessions = {}
 
-    # Переход к уточнению данных
-    await message.answer(TEXT_CLARIFYING)
-    await state.set_state(ReadyDocFSM.clarifying_data)
+@dp.message_handler(commands=["start"])
+async def start(message: types.Message):
+    await message.reply(
+        "Привет! Я помогу тебе составить юридический договор. Просто опиши, что нужно 👇\n\n"
+        "Например: \"договор на оказание услуг между ООО и ИП на 120 тыс с 1 мая\"",
+        reply_markup=main_menu
+    )
+    user_sessions[message.from_user.id] = {"step": "awaiting_description"}
 
-# Шаг 2: Уточнение данных
-@dp.message(StateFilter(ReadyDocFSM.clarifying_data))  # Используем StateFilter
-async def collect_clarification(message: Message, state: FSMContext):
-    user_data = await state.get_data()
+@dp.message_handler(lambda m: m.text == "✍️ Создать документ")
+async def manual_start(message: types.Message):
+    await message.reply("📝 Опиши, какой договор нужен:")
+    user_sessions[message.from_user.id] = {"step": "awaiting_description"}
 
-    # Пример уточнения (если нужно)
-    if message.text:
-        user_data["clarified_info"] = message.text
-        await state.update_data(user_data)
+@dp.message_handler(lambda m: m.text == "❌ Отмена")
+async def cancel(message: types.Message):
+    user_sessions.pop(message.from_user.id, None)
+    await message.reply("Окей! Чтобы начать снова — нажми «Создать документ»", reply_markup=main_menu)
 
-    # Переход к генерации документа
-    await message.answer("Генерируем черновик документа...")
-    await state.set_state(ReadyDocFSM.generating_draft)
-    await generate_draft(message)
+@dp.message_handler(lambda m: user_sessions.get(m.from_user.id, {}).get("step") == "awaiting_description")
+async def handle_description(message: types.Message):
+    prompt = message.text.strip()
+    await message.reply("🤖 Генерирую документ... Это может занять 5–10 секунд.")
 
-# Шаг 3: Генерация документа
-async def generate_draft(message: Message):
-    user_data = await dp.storage.get_data(message.from_user.id)
+    try:
+        contract_text = generate_full_contract(prompt)
 
-    # Пример генерации документа (замени на реальную логику)
-    document_text = f"Документ для компании {user_data.get('company_name')}."
+        # Сохраняем текст в Word-файл
+        doc = Document()
+        for line in contract_text.split("\n"):
+            doc.add_paragraph(line)
 
-    # Переход к юридической проверке
-    await message.answer("Проверяем юридическую актуальность документа...")
-    await legal_check(message, document_text)
+        file_path = f"/tmp/contract_{message.from_user.id}.docx"
+        doc.save(file_path)
 
-# Шаг 4: Юридическая проверка
-async def legal_check(message: Message, document_text: str):
-    # Пример проверки (замени на реальную логику)
-    legal_issues = "Нет проблем с законом."  # Это заглушка
+        await message.reply_document(open(file_path, "rb"), caption="✅ Готово! Вот твой договор.")
+    except Exception as e:
+        logging.error(f"Ошибка генерации: {e}")
+        await message.reply("⚠️ Что-то пошло не так. Попробуй снова или измени описание.")
 
-    if legal_issues:
-        # Если есть проблемы, отправляем уведомление
-        await message.answer(f"Проблемы: {legal_issues}")
-        await message.answer("Начинаю исправления...")
-        await fix_issues(message)
-    else:
-        # Если всё в порядке, финализируем документ
-        await message.answer("Документ в порядке.")
-        await finalize_document(message, document_text)
-
-# Шаг 5: Исправление проблем
-async def fix_issues(message: Message):
-    # Логика исправления (если нужно)
-    await message.answer("Исправляю...")
-    await generate_draft(message)  # Повторная генерация с исправлениями
-
-# Шаг 6: Финализация и отправка документа
-async def finalize_document(message: Message, document_text: str):
-    # Генерация .docx файла (это заглушка, замените на реальную логику)
-    doc_file = document_text  # Пока просто текст
-
-    # Отправка документа пользователю
-    await message.answer("Ваш документ готов!")
-    await message.answer_document(doc_file)
-    
-    # Завершаем процесс
-    await message.answer("Спасибо за использование нашего сервиса.")
-
-# Основной цикл
-async def main():
-    # Запуск обработки сообщений
-    await dp.start_polling(bot)
+    user_sessions.pop(message.from_user.id, None)
 
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+    executor.start_polling(dp, skip_updates=True)
