@@ -1,69 +1,113 @@
-import os
 import logging
-from aiogram import Bot, Dispatcher, types, executor
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
-from docx import Document
-from utils.gpt_text_gen import generate_full_contract
-from utils.docgen import generate_doc, normalize
-from utils.gpt import extract_doc_data, gpt_add_section
-from utils.sheets import save_row
+from aiogram import Bot, Dispatcher, types
+from aiogram.types import ReplyKeyboardRemove
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
+from aiogram.dispatcher import FSMContext
+from aiogram.dispatcher.filters.state import State, StatesGroup
+from aiogram.utils import executor
+import openai
+import os
+from dotenv import load_dotenv
 
+# Загрузка переменных окружения
+load_dotenv()
+
+# Настройки логирования
 logging.basicConfig(level=logging.INFO)
 
-API_TOKEN = os.getenv("API_TOKEN")
-bot = Bot(token=API_TOKEN)
-dp = Dispatcher(bot)
+# Инициализация бота и диспетчера
+bot = Bot(token=os.getenv('BOT_TOKEN'))
+dp = Dispatcher(bot, storage=MemoryStorage())
 
-# Главное меню
-main_menu = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-main_menu.add(
-    KeyboardButton("✍️ Создать документ"),
-    KeyboardButton("❌ Отмена")
-)
+# Инициализация OpenAI
+openai.api_key = os.getenv('OPENAI_API_KEY')
 
-user_sessions = {}
+# Определение состояний
+class DocumentCreation(StatesGroup):
+    waiting_for_document_type = State()
+    waiting_for_parties = State()
+    waiting_for_purpose = State()
+    waiting_for_key_terms = State()
+    waiting_for_special_requirements = State()
 
-@dp.message_handler(commands=["start"])
-async def start(message: types.Message):
-    await message.reply(
-        "Привет! Я помогу тебе составить юридический договор. Просто опиши, что нужно 👇\n\n"
-        "Например: \"договор на оказание услуг между ООО и ИП на 120 тыс с 1 мая\"",
-        reply_markup=main_menu
+# Стартовая команда
+@dp.message_handler(commands='start')
+async def cmd_start(message: types.Message):
+    await message.answer(
+        "Здравствуйте! Какой документ Вам нужен?",
+        reply_markup=ReplyKeyboardRemove()
     )
-    user_sessions[message.from_user.id] = {"step": "awaiting_description"}
+    await DocumentCreation.waiting_for_document_type.set()
 
-@dp.message_handler(lambda m: m.text == "✍️ Создать документ")
-async def manual_start(message: types.Message):
-    await message.reply("📝 Опиши, какой договор нужен:")
-    user_sessions[message.from_user.id] = {"step": "awaiting_description"}
+# Обработка типа документа
+@dp.message_handler(state=DocumentCreation.waiting_for_document_type)
+async def process_document_type(message: types.Message, state: FSMContext):
+    await state.update_data(document_type=message.text)
+    await message.answer("Кто стороны документа?")
+    await DocumentCreation.next()
 
-@dp.message_handler(lambda m: m.text == "❌ Отмена")
-async def cancel(message: types.Message):
-    user_sessions.pop(message.from_user.id, None)
-    await message.reply("Окей! Чтобы начать снова — нажми «Создать документ»", reply_markup=main_menu)
+# Обработка сторон
+@dp.message_handler(state=DocumentCreation.waiting_for_parties)
+async def process_parties(message: types.Message, state: FSMContext):
+    await state.update_data(parties=message.text)
+    await message.answer("Какова цель документа?")
+    await DocumentCreation.next()
 
-@dp.message_handler(lambda m: user_sessions.get(m.from_user.id, {}).get("step") == "awaiting_description")
-async def handle_description(message: types.Message):
-    prompt = message.text.strip()
-    await message.reply("🤖 Генерирую документ... Это может занять 5–10 секунд.")
+# Обработка цели
+@dp.message_handler(state=DocumentCreation.waiting_for_purpose)
+async def process_purpose(message: types.Message, state: FSMContext):
+    await state.update_data(purpose=message.text)
+    await message.answer("Какие ключевые условия должны быть учтены?")
+    await DocumentCreation.next()
+
+# Обработка ключевых условий
+@dp.message_handler(state=DocumentCreation.waiting_for_key_terms)
+async def process_key_terms(message: types.Message, state: FSMContext):
+    await state.update_data(key_terms=message.text)
+    await message.answer("Есть ли особые требования или пожелания?")
+    await DocumentCreation.next()
+
+# Обработка особых требований и генерация документа
+@dp.message_handler(state=DocumentCreation.waiting_for_special_requirements)
+async def process_special_requirements(message: types.Message, state: FSMContext):
+    await state.update_data(special_requirements=message.text)
+    user_data = await state.get_data()
+
+    # Формирование промта для OpenAI
+    prompt = (
+        f"Создай юридический документ на русском языке, соответствующий законодательству РФ.\n\n"
+        f"Тип документа: {user_data['document_type']}\n"
+        f"Стороны: {user_data['parties']}\n"
+        f"Цель документа: {user_data['purpose']}\n"
+        f"Ключевые условия: {user_data['key_terms']}\n"
+        f"Особые требования: {user_data['special_requirements']}\n\n"
+        f"Документ должен быть официальным, юридически грамотным и готовым для использования."
+    )
+
+    await message.answer("Генерирую документ, пожалуйста, подождите...")
 
     try:
-        contract_text = generate_full_contract(prompt)
-
-        # Сохраняем текст в Word-файл
-        doc = Document()
-        for line in contract_text.split("\n"):
-            doc.add_paragraph(line)
-
-        file_path = f"/tmp/contract_{message.from_user.id}.docx"
-        doc.save(file_path)
-
-        await message.reply_document(open(file_path, "rb"), caption="✅ Готово! Вот твой договор.")
+        response = await generate_document(prompt)
+        await message.answer(response)
     except Exception as e:
-        logging.error(f"Ошибка генерации: {e}")
-        await message.reply("⚠️ Что-то пошло не так. Попробуй снова или измени описание.")
+        logging.error(f"Ошибка при генерации документа: {e}")
+        await message.answer("Произошла ошибка при генерации документа. Попробуйте позже.")
+    
+    await state.finish()
 
-    user_sessions.pop(message.from_user.id, None)
+# Функция генерации документа через OpenAI
+async def generate_document(prompt: str) -> str:
+    completion = await openai.ChatCompletion.acreate(
+        model="gpt-4",
+        messages=[
+            {"role": "system", "content": "Ты опытный юрист, создающий юридические документы."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.3,
+        max_tokens=3000
+    )
+    return completion.choices[0].message.content.strip()
 
-if __name__ == "__main__":
+# Запуск бота
+if __name__ == '__main__':
     executor.start_polling(dp, skip_updates=True)
