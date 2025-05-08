@@ -47,7 +47,9 @@ async def cmd_start(message: Message, state: FSMContext):
 @router.message(DocumentCreation.waiting_for_document_type)
 async def process_document_type(message: Message, state: FSMContext):
     await state.update_data(document_type=message.text)
-    await message.answer("Кто стороны документа?")
+    await message.answer("""**Приветствуем вас!**
+Давайте за несколько вопросов подготовим юридически корректный документ.
+Всё просто: отвечайте в свободной форме.""")
     await state.set_state(DocumentCreation.waiting_for_parties)
 
 # Обработка сторон
