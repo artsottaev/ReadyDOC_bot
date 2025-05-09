@@ -11,98 +11,104 @@ from aiogram.types import Message
 from dotenv import load_dotenv
 import openai
 
-# Загрузка переменных окружения
 load_dotenv()
-
-# Настройки логирования
 logging.basicConfig(level=logging.INFO)
 
-# Инициализация бота
 bot = Bot(token=os.getenv('BOT_TOKEN'), parse_mode=ParseMode.HTML)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 router = Router()
 dp.include_router(router)
 
-# Инициализация OpenAI
 openai.api_key = os.getenv('OPENAI_API_KEY')
 
-# Определение состояний
 class DocumentCreation(StatesGroup):
-    waiting_for_document_type = State()
-    waiting_for_parties = State()
-    waiting_for_purpose = State()
-    waiting_for_key_terms = State()
-    waiting_for_special_requirements = State()
+    waiting_for_missing_info = State()
+    waiting_for_post_edit = State()
 
-# Стартовая команда
+def parse_intent(text: str) -> dict:
+    result = {}
+    lowered = text.lower()
+
+    if "аренда" in lowered:
+        result["document_type"] = "договор аренды"
+        result["purpose"] = "аренда имущества"
+    elif "поставк" in lowered:
+        result["document_type"] = "договор поставки"
+        result["purpose"] = "поставка товаров"
+    elif "оказание услуг" in lowered or "услуги" in lowered:
+        result["document_type"] = "договор оказания услуг"
+        result["purpose"] = "оказание услуг"
+    elif "подряд" in lowered:
+        result["document_type"] = "договор подряда"
+        result["purpose"] = "выполнение работ по заказу"
+
+    if any(entity in lowered for entity in ["ип", "ооо", "заказчик", "исполнитель"]):
+        result["parties"] = text  # упрощённо считаем, что стороны указаны в тексте
+
+    return result
+
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
-    await message.answer(
-        "Здравствуйте! Какой документ Вам нужен?"
-    )
-    await state.set_state(DocumentCreation.waiting_for_document_type)
+    await message.answer("Здравствуйте! Опишите, какой документ вам нужен (например: договор аренды между ИП и ООО).")
+    await state.set_state(DocumentCreation.waiting_for_missing_info)
 
-# Обработка типа документа
-@router.message(DocumentCreation.waiting_for_document_type)
-async def process_document_type(message: Message, state: FSMContext):
-    await state.update_data(document_type=message.text)
-    await message.answer("""**Приветствуем вас!**
-Давайте за несколько вопросов подготовим юридически корректный документ.
-Всё просто: отвечайте в свободной форме.""")
-    await state.set_state(DocumentCreation.waiting_for_parties)
+@router.message(DocumentCreation.waiting_for_missing_info)
+async def handle_initial_description(message: Message, state: FSMContext):
+    parsed = parse_intent(message.text)
+    await state.update_data(**parsed)
+    data = await state.get_data()
 
-# Обработка сторон
-@router.message(DocumentCreation.waiting_for_parties)
-async def process_parties(message: Message, state: FSMContext):
-    await state.update_data(parties=message.text)
-    await message.answer("Какова цель документа?")
-    await state.set_state(DocumentCreation.waiting_for_purpose)
+    missing = []
+    if "document_type" not in data:
+        missing.append("тип документа")
+    if "parties" not in data:
+        missing.append("стороны")
+    if "purpose" not in data:
+        missing.append("цель")
 
-# Обработка цели
-@router.message(DocumentCreation.waiting_for_purpose)
-async def process_purpose(message: Message, state: FSMContext):
-    await state.update_data(purpose=message.text)
-    await message.answer("Какие ключевые условия должны быть учтены?")
-    await state.set_state(DocumentCreation.waiting_for_key_terms)
+    if missing:
+        await message.answer(f"Пожалуйста, уточните: {', '.join(missing)}")
+        return
 
-# Обработка ключевых условий
-@router.message(DocumentCreation.waiting_for_key_terms)
-async def process_key_terms(message: Message, state: FSMContext):
-    await state.update_data(key_terms=message.text)
-    await message.answer("Есть ли особые требования или пожелания?")
-    await state.set_state(DocumentCreation.waiting_for_special_requirements)
+    await message.answer("Формирую черновик документа, пожалуйста, подождите...")
+    doc_text = await generate_document(data)
+    await state.update_data(generated_doc=doc_text)
+    await message.answer(doc_text)
 
-# Обработка особых требований и генерация документа
-@router.message(DocumentCreation.waiting_for_special_requirements)
-async def process_special_requirements(message: Message, state: FSMContext):
-    await state.update_data(special_requirements=message.text)
-    user_data = await state.get_data()
+    await message.answer("Хотите ли вы добавить особые условия или уточнения к этому документу?")
+    await state.set_state(DocumentCreation.waiting_for_post_edit)
 
-    # Формирование промта для OpenAI
+@router.message(DocumentCreation.waiting_for_post_edit)
+async def handle_post_edit(message: Message, state: FSMContext):
+    user_note = message.text
+    data = await state.get_data()
     prompt = (
-        f"Создай юридический документ на русском языке, соответствующий законодательству РФ.\n\n"
-        f"Тип документа: {user_data['document_type']}\n"
-        f"Стороны: {user_data['parties']}\n"
-        f"Цель документа: {user_data['purpose']}\n"
-        f"Ключевые условия: {user_data['key_terms']}\n"
-        f"Особые требования: {user_data['special_requirements']}\n\n"
-        f"Документ должен быть официальным, юридически грамотным и готовым для использования."
+        f"Допиши/уточни следующий юридический документ с учётом следующих требований пользователя:\n"
+        f"\nДокумент:\n{data['generated_doc']}\n"
+        f"\nТребования пользователя:\n{user_note}"
     )
-
-    await message.answer("Генерирую документ, пожалуйста, подождите...")
-
+    await message.answer("Уточняю документ...")
     try:
-        response = await generate_document(prompt)
-        await message.answer(response)
+        refined = await generate_document({"prompt_override": prompt})
+        await message.answer(refined)
     except Exception as e:
-        logging.error(f"Ошибка при генерации документа: {e}")
-        await message.answer("Произошла ошибка при генерации документа. Попробуйте позже.")
-
+        logging.error(f"Ошибка уточнения документа: {e}")
+        await message.answer("Произошла ошибка при уточнении документа.")
     await state.clear()
 
-# Функция генерации документа через OpenAI
-async def generate_document(prompt: str) -> str:
+async def generate_document(data: dict) -> str:
+    if "prompt_override" in data:
+        prompt = data["prompt_override"]
+    else:
+        prompt = (
+            f"Создай юридический документ на русском языке, соответствующий законодательству РФ.\n\n"
+            f"Тип документа: {data['document_type']}\n"
+            f"Стороны: {data['parties']}\n"
+            f"Цель документа: {data['purpose']}\n\n"
+            f"Документ должен быть официальным, юридически грамотным и готовым для использования."
+        )
+
     completion = await openai.ChatCompletion.acreate(
         model="gpt-4",
         messages=[
@@ -114,7 +120,6 @@ async def generate_document(prompt: str) -> str:
     )
     return completion.choices[0].message.content.strip()
 
-# Запуск бота
 async def main():
     await dp.start_polling(bot)
 
