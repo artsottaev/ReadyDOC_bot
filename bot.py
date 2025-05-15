@@ -14,7 +14,7 @@ from aiogram.types import Message, FSInputFile
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
 from docx import Document
-from redis.asyncio import RedisError
+from redis.asyncio import RedisError, ConnectionError as RedisConnectionError
 
 # Очистка переменных окружения прокси до импорта других модулей
 os.environ.pop("HTTP_PROXY", None)
@@ -34,7 +34,7 @@ load_dotenv()
 # Валидация обязательных переменных
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-REDIS_URL = os.getenv("REDIS_URL")  # Используем полный URL из Render
+REDIS_URL = os.getenv("REDIS_URL")
 
 if not all([BOT_TOKEN, OPENAI_API_KEY, REDIS_URL]):
     raise EnvironmentError(
@@ -42,7 +42,7 @@ if not all([BOT_TOKEN, OPENAI_API_KEY, REDIS_URL]):
         "BOT_TOKEN, OPENAI_API_KEY, REDIS_URL"
     )
 
-# Инициализация OpenAI клиента с кастомными настройками
+# Инициализация OpenAI клиента
 openai_client = AsyncOpenAI(
     api_key=OPENAI_API_KEY,
     http_client=httpx.AsyncClient(
@@ -55,26 +55,25 @@ openai_client = AsyncOpenAI(
     )
 )
 
-# Конфигурация SSL для Redis
+# Конфигурация Redis
 redis_ssl_context = ssl.create_default_context()
 redis_ssl_context.check_hostname = False
 redis_ssl_context.verify_mode = ssl.CERT_NONE
 
-# Инициализация Redis Storage
 try:
     storage = RedisStorage.from_url(
         REDIS_URL,
-        ssl_cert_reqs=None,  # Отключаем проверку SSL сертификата
-        ssl=redis_ssl_context,
-        socket_timeout=10,
-        retry_on_timeout=True,
         connection_kwargs={
+            "ssl": redis_ssl_context,
+            "socket_timeout": 10,
             "socket_connect_timeout": 5,
-            "health_check_interval": 30
+            "retry_on_timeout": True,
+            "health_check_interval": 30,
+            "decode_responses": True
         }
     )
-except RedisError as e:
-    logger.critical(f"Ошибка подключения к Redis: {e}")
+except (RedisError, RedisConnectionError) as e:
+    logger.critical(f"Redis connection error: {str(e)}")
     raise
 
 # Инициализация бота и диспетчера
@@ -85,6 +84,19 @@ dp = Dispatcher(storage=storage)
 class DocGenState(StatesGroup):
     waiting_for_initial_input = State()
     waiting_for_special_terms = State()
+
+# Проверка подключения к Redis
+async def check_redis_connection():
+    try:
+        async with storage.redis.client() as redis:
+            if await redis.ping():
+                logger.info("✅ Redis connection verified")
+                return True
+            logger.error("❌ Redis ping failed")
+            return False
+    except Exception as e:
+        logger.critical(f"Redis connection failed: {str(e)}")
+        raise
 
 # Генерация документов через OpenAI
 async def generate_gpt_response(system_prompt: str, user_prompt: str) -> str:
@@ -100,12 +112,11 @@ async def generate_gpt_response(system_prompt: str, user_prompt: str) -> str:
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
-        logger.error(f"Ошибка OpenAI: {e}\n{traceback.format_exc()}")
+        logger.error(f"OpenAI error: {e}\n{traceback.format_exc()}")
         return "❌ Произошла ошибка при генерации документа. Попробуйте позже."
 
 # Работа с DOCX файлами
 def save_docx(text: str, filename: str) -> str:
-    """Создает временный DOCX файл и возвращает путь к нему"""
     try:
         doc = Document()
         for para in text.split("\n"):
@@ -114,15 +125,13 @@ def save_docx(text: str, filename: str) -> str:
         
         temp_dir = tempfile.gettempdir()
         filepath = os.path.join(temp_dir, filename)
-        
         doc.save(filepath)
         return filepath
     except Exception as e:
-        logger.error(f"Ошибка создания DOCX: {e}\n{traceback.format_exc()}")
+        logger.error(f"DOCX creation error: {e}\n{traceback.format_exc()}")
         raise
 
 async def safe_send_document(message: Message, path: str):
-    """Безопасная отправка документа с очисткой временного файла"""
     try:
         await message.answer_document(FSInputFile(path))
     finally:
@@ -130,24 +139,11 @@ async def safe_send_document(message: Message, path: str):
             try:
                 os.unlink(path)
             except Exception as e:
-                logger.warning(f"Ошибка удаления файла {path}: {e}")
-
-# Проверка подключения к Redis перед запуском
-async def check_redis_connection():
-    try:
-        redis = await storage.redis()
-        if await redis.ping():
-            logger.info("✅ Успешное подключение к Redis")
-        else:
-            logger.error("❌ Не удалось проверить подключение к Redis")
-    except Exception as e:
-        logger.critical(f"❌ Критическая ошибка Redis: {e}")
-        raise
+                logger.warning(f"File deletion error {path}: {e}")
 
 # Обработчики команд
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message, state: FSMContext):
-    """Обработчик команды /start"""
     try:
         await state.clear()
         await message.answer(
@@ -157,12 +153,11 @@ async def cmd_start(message: Message, state: FSMContext):
         )
         await state.set_state(DocGenState.waiting_for_initial_input)
     except Exception as e:
-        logger.error(f"Ошибка в /start: {e}\n{traceback.format_exc()}")
+        logger.error(f"/start error: {e}\n{traceback.format_exc()}")
         await message.answer("⚠️ Произошла внутренняя ошибка. Попробуйте позже.")
 
 @dp.message(DocGenState.waiting_for_initial_input)
 async def handle_description(message: Message, state: FSMContext):
-    """Обработка первоначального описания документа"""
     try:
         if len(message.text) > 3000:
             await message.answer("⚠️ Слишком длинный текст. Укороти, пожалуйста.")
@@ -186,13 +181,12 @@ async def handle_description(message: Message, state: FSMContext):
         await state.set_state(DocGenState.waiting_for_special_terms)
         
     except Exception as e:
-        logger.error(f"Ошибка обработки описания: {e}\n{traceback.format_exc()}")
+        logger.error(f"Description processing error: {e}\n{traceback.format_exc()}")
         await message.answer("⚠️ Произошла ошибка при обработке запроса. Попробуйте снова.")
         await state.clear()
 
 @dp.message(DocGenState.waiting_for_special_terms)
 async def handle_additions(message: Message, state: FSMContext):
-    """Обработка дополнительных условий"""
     try:
         data = await state.get_data()
         base_text = data.get("document_text", "")
@@ -220,7 +214,7 @@ async def handle_additions(message: Message, state: FSMContext):
         await state.clear()
         
     except Exception as e:
-        logger.error(f"Ошибка обработки условий: {e}\n{traceback.format_exc()}")
+        logger.error(f"Additions processing error: {e}\n{traceback.format_exc()}")
         await message.answer("⚠️ Произошла ошибка при обработке условий. Попробуйте снова.")
         await state.clear()
 
@@ -228,10 +222,9 @@ async def handle_additions(message: Message, state: FSMContext):
 if __name__ == "__main__":
     try:
         logger.info("Starting bot...")
-        # Проверка подключения к Redis перед запуском
         asyncio.run(check_redis_connection())
         asyncio.run(dp.start_polling(bot))
     except KeyboardInterrupt:
-        logger.info("Bot stopped")
+        logger.info("Bot stopped gracefully")
     except Exception as e:
-        logger.critical(f"Critical error: {e}\n{traceback.format_exc()}")
+        logger.critical(f"Fatal error: {str(e)}\n{traceback.format_exc()}")
