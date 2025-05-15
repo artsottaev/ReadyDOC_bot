@@ -4,7 +4,6 @@ import asyncio
 import tempfile
 import traceback
 import httpx
-import ssl
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -14,9 +13,9 @@ from aiogram.types import Message, FSInputFile
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
 from docx import Document
-from redis.asyncio import RedisError, ConnectionError as RedisConnectionError
+from redis.asyncio import Redis, RedisError, ConnectionError as RedisConnectionError
 
-# Очистка переменных окружения прокси до импорта других модулей
+# Очистка переменных окружения прокси
 os.environ.pop("HTTP_PROXY", None)
 os.environ.pop("HTTPS_PROXY", None)
 os.environ.pop("ALL_PROXY", None)
@@ -55,23 +54,19 @@ openai_client = AsyncOpenAI(
     )
 )
 
-# Конфигурация Redis
-redis_ssl_context = ssl.create_default_context()
-redis_ssl_context.check_hostname = False
-redis_ssl_context.verify_mode = ssl.CERT_NONE
-
+# Инициализация Redis
 try:
-    storage = RedisStorage.from_url(
+    redis_client = Redis.from_url(
         REDIS_URL,
-        connection_kwargs={
-            "ssl": redis_ssl_context,
-            "socket_timeout": 10,
-            "socket_connect_timeout": 5,
-            "retry_on_timeout": True,
-            "health_check_interval": 30,
-            "decode_responses": True
-        }
+        ssl=True,
+        ssl_cert_reqs=None,
+        socket_timeout=10,
+        socket_connect_timeout=5,
+        retry_on_timeout=True,
+        decode_responses=True,
+        health_check_interval=30
     )
+    storage = RedisStorage(redis=redis_client)
 except (RedisError, RedisConnectionError) as e:
     logger.critical(f"Redis connection error: {str(e)}")
     raise
@@ -85,15 +80,14 @@ class DocGenState(StatesGroup):
     waiting_for_initial_input = State()
     waiting_for_special_terms = State()
 
-# Проверка подключения к Redis
+# Проверка подключения Redis
 async def check_redis_connection():
     try:
-        async with storage.redis.client() as redis:
-            if await redis.ping():
-                logger.info("✅ Redis connection verified")
-                return True
-            logger.error("❌ Redis ping failed")
-            return False
+        if await redis_client.ping():
+            logger.info("✅ Redis connection verified")
+            return True
+        logger.error("❌ Redis ping failed")
+        return False
     except Exception as e:
         logger.critical(f"Redis connection failed: {str(e)}")
         raise
