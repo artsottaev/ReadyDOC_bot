@@ -13,7 +13,7 @@ from aiogram.types import Message, FSInputFile
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
 from docx import Document
-from redis.asyncio import Redis, RedisError, ConnectionError as RedisConnectionError
+from redis.asyncio import Redis, RedisError
 
 # Очистка переменных окружения прокси
 os.environ.pop("HTTP_PROXY", None)
@@ -58,8 +58,6 @@ openai_client = AsyncOpenAI(
 try:
     redis_client = Redis.from_url(
         REDIS_URL,
-        ssl=True,
-        ssl_cert_reqs=None,
         socket_timeout=10,
         socket_connect_timeout=5,
         retry_on_timeout=True,
@@ -67,7 +65,7 @@ try:
         health_check_interval=30
     )
     storage = RedisStorage(redis=redis_client)
-except (RedisError, RedisConnectionError) as e:
+except RedisError as e:
     logger.critical(f"Redis connection error: {str(e)}")
     raise
 
