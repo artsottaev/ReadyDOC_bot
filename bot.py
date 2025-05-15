@@ -4,6 +4,7 @@ import asyncio
 import tempfile
 import traceback
 import httpx
+import ssl
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -33,13 +34,12 @@ load_dotenv()
 # Валидация обязательных переменных
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-REDIS_HOST = os.getenv("REDIS_HOST")
-REDIS_PORT = os.getenv("REDIS_PORT", "6379")
+REDIS_URL = os.getenv("REDIS_URL")  # Используем полный URL из Render
 
-if not all([BOT_TOKEN, OPENAI_API_KEY, REDIS_HOST]):
+if not all([BOT_TOKEN, OPENAI_API_KEY, REDIS_URL]):
     raise EnvironmentError(
         "Не заданы обязательные переменные окружения: "
-        "BOT_TOKEN, OPENAI_API_KEY, REDIS_HOST"
+        "BOT_TOKEN, OPENAI_API_KEY, REDIS_URL"
     )
 
 # Инициализация OpenAI клиента с кастомными настройками
@@ -55,11 +55,23 @@ openai_client = AsyncOpenAI(
     )
 )
 
+# Конфигурация SSL для Redis
+redis_ssl_context = ssl.create_default_context()
+redis_ssl_context.check_hostname = False
+redis_ssl_context.verify_mode = ssl.CERT_NONE
+
 # Инициализация Redis Storage
 try:
     storage = RedisStorage.from_url(
-        f"redis://{REDIS_HOST}:{REDIS_PORT}/0",
-        connection_kwargs={"socket_timeout": 5}
+        REDIS_URL,
+        ssl_cert_reqs=None,  # Отключаем проверку SSL сертификата
+        ssl=redis_ssl_context,
+        socket_timeout=10,
+        retry_on_timeout=True,
+        connection_kwargs={
+            "socket_connect_timeout": 5,
+            "health_check_interval": 30
+        }
     )
 except RedisError as e:
     logger.critical(f"Ошибка подключения к Redis: {e}")
@@ -119,6 +131,18 @@ async def safe_send_document(message: Message, path: str):
                 os.unlink(path)
             except Exception as e:
                 logger.warning(f"Ошибка удаления файла {path}: {e}")
+
+# Проверка подключения к Redis перед запуском
+async def check_redis_connection():
+    try:
+        redis = await storage.redis()
+        if await redis.ping():
+            logger.info("✅ Успешное подключение к Redis")
+        else:
+            logger.error("❌ Не удалось проверить подключение к Redis")
+    except Exception as e:
+        logger.critical(f"❌ Критическая ошибка Redis: {e}")
+        raise
 
 # Обработчики команд
 @dp.message(F.text == "/start")
@@ -204,6 +228,8 @@ async def handle_additions(message: Message, state: FSMContext):
 if __name__ == "__main__":
     try:
         logger.info("Starting bot...")
+        # Проверка подключения к Redis перед запуском
+        asyncio.run(check_redis_connection())
         asyncio.run(dp.start_polling(bot))
     except KeyboardInterrupt:
         logger.info("Bot stopped")
