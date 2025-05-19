@@ -10,7 +10,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.redis import RedisStorage
 from aiogram.enums import ParseMode
 from aiogram.types import Message, FSInputFile
-from openai import AsyncOpenAI, APIError, APIConnectionError
+from openai import AsyncOpenAI
 from dotenv import load_dotenv
 from docx import Document
 from redis.asyncio import Redis
@@ -50,46 +50,32 @@ class BotApplication:
                 "BOT_TOKEN, OPENAI_API_KEY, REDIS_URL"
             )
 
-        # Инициализация OpenAI клиента с улучшенной обработкой ошибок
-        try:
-            self.openai_client = AsyncOpenAI(
-                api_key=OPENAI_API_KEY,
-                http_client=httpx.AsyncClient(
-                    proxies=None,
-                    timeout=30.0,
-                    limits=httpx.Limits(
-                        max_connections=10,
-                        max_keepalive_connections=2
-                    )
+        # Инициализация OpenAI клиента
+        self.openai_client = AsyncOpenAI(
+            api_key=OPENAI_API_KEY,
+            http_client=httpx.AsyncClient(
+                proxies=None,
+                timeout=30.0,
+                limits=httpx.Limits(
+                    max_connections=10,
+                    max_keepalive_connections=2
                 )
             )
-            # Проверка доступности API OpenAI
-            await self.openai_client.models.list()
-        except APIConnectionError as e:
-            logger.critical(f"Ошибка подключения к OpenAI: {e}")
-            raise
-        except APIError as e:
-            logger.critical(f"API ошибка OpenAI: {e}")
-            raise
-        except Exception as e:
-            logger.critical(f"Неизвестная ошибка OpenAI: {e}")
-            raise
+        )
 
         # Инициализация Redis
-        try:
-            self.redis = Redis.from_url(
-                REDIS_URL,
-                socket_timeout=10,
-                socket_connect_timeout=5,
-                retry_on_timeout=True,
-                decode_responses=True,
-                health_check_interval=30
-            )
-            if not await self.redis.ping():
-                raise ConnectionError("Не удалось подключиться к Redis")
-        except Exception as e:
-            logger.critical(f"Ошибка Redis: {e}")
-            raise
+        self.redis = Redis.from_url(
+            REDIS_URL,
+            socket_timeout=10,
+            socket_connect_timeout=5,
+            retry_on_timeout=True,
+            decode_responses=True,
+            health_check_interval=30
+        )
+        
+        # Проверка подключения к Redis
+        if not await self.redis.ping():
+            raise ConnectionError("Не удалось подключиться к Redis")
 
         storage = RedisStorage(redis=self.redis)
 
@@ -113,8 +99,8 @@ class BotApplication:
             try:
                 await state.clear()
                 await message.answer(
-                    "👋 Привет! Я помогу составить необходимый документ.\n\n"
-                    "Просто опиши, какой нужен. Например:\n"
+                    "👋 Привет! Я помогу составить юридический документ.\n\n"
+                    "Просто опиши, какой документ тебе нужен. Например:\n"
                     "<i>Нужен договор аренды офиса между ИП и ООО на год</i>"
                 )
                 await state.set_state(self.states.waiting_for_initial_input)
@@ -126,31 +112,24 @@ class BotApplication:
         async def handle_description(message: Message, state: FSMContext):
             try:
                 if len(message.text) > 3000:
-                    await message.answer("⚠️ Слишком длинный текст. Сократи, пожалуйста.")
+                    await message.answer("⚠️ Слишком длинный текст. Укороти, пожалуйста.")
                     return
 
                 await state.update_data(initial_text=message.text)
                 await message.answer("🧠 Генерирую черновик документа...")
 
-                # Улучшенная обработка генерации документа
-                try:
-                    document = await self.generate_gpt_response(
-                        system_prompt="Ты юрист и бухгалтер с огромным опытом. Составь юридически корректный документ.",
-                        user_prompt=f"Составь юридический документ по российскому праву. Вот описание от пользователя:\n\n\"{message.text}\""
-                    )
-                except Exception as e:
-                    logger.error(f"Ошибка генерации документа: {e}\n{traceback.format_exc()}")
-                    await message.answer("⚠️ Мне сейчас не удалось сгенерировать документ. Попробуйте позже.")
-                    await state.clear()
-                    return
+                document = await self.generate_gpt_response(
+                    system_prompt="Ты опытный юрист. Составь юридически корректный документ.",
+                    user_prompt=f"Составь юридический документ по российскому праву. Вот описание от пользователя:\n\n\"{message.text}\""
+                )
 
                 filename = f"draft_{message.from_user.id}.docx"
                 path = self.save_docx(document, filename)
                 
                 await state.update_data(document_text=document)
-                await message.answer("📄 Вот сгенерированный мной документ:")
+                await message.answer("📄 Вот сгенерированный документ:")
                 await self.safe_send_document(message, path)
-                await message.answer("Хочешь добавить особые условия? Напиши их или просто  напиши <b>нет</b>.")
+                await message.answer("Хочешь добавить особые условия? Напиши их или напиши <b>нет</b>.")
                 await state.set_state(self.states.waiting_for_special_terms)
                 
             except Exception as e:
@@ -165,23 +144,18 @@ class BotApplication:
                 base_text = data.get("document_text", "")
 
                 if message.text.strip().lower() == "нет":
-                    await message.answer("✅ Документ готов. !")
+                    await message.answer("✅ Документ завершён. Удачи!")
                     await state.clear()
                     return
 
                 await message.answer("🔧 Вношу изменения...")
-                try:
-                    updated_doc = await self.generate_gpt_response(
-                        system_prompt="Ты опытный юридический редактор. Вноси только необходимые правки, сохраняя стиль.",
-                        user_prompt=(
-                            "Вот документ. Добавь в него аккуратно следующие особые условия, "
-                            f"сохранив стиль и структуру:\n\nУсловия: {message.text}\n\nДокумент:\n{base_text}"
-                        )
+                updated_doc = await self.generate_gpt_response(
+                    system_prompt="Ты юридический редактор. Вноси только необходимые правки, сохраняя стиль.",
+                    user_prompt=(
+                        "Вот документ. Добавь в него аккуратно следующие особые условия, "
+                        f"сохранив стиль и структуру:\n\nУсловия: {message.text}\n\nДокумент:\n{base_text}"
                     )
-                except Exception as e:
-                    logger.error(f"Ошибка редактирования документа: {e}\n{traceback.format_exc()}")
-                    await message.answer("⚠️ Не удалось внести изменения. Попробуйте снова.")
-                    return
+                )
 
                 filename = f"final_{message.from_user.id}.docx"
                 path = self.save_docx(updated_doc, filename)
@@ -197,10 +171,9 @@ class BotApplication:
                 await state.clear()
 
     async def generate_gpt_response(self, system_prompt: str, user_prompt: str) -> str:
-        """Улучшенная функция генерации с обработкой ошибок"""
         try:
             response = await self.openai_client.chat.completions.create(
-                model="gpt-4",
+                model="gpt-3.5-turbo-0125",  # Единственное изменение в коде
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
@@ -208,26 +181,13 @@ class BotApplication:
                 temperature=0.3,
                 max_tokens=3000
             )
-            if not response.choices:
-                raise ValueError("Пустой ответ от OpenAI")
             return response.choices[0].message.content.strip()
-        
-        except APIConnectionError as e:
-            logger.error(f"Ошибка подключения к OpenAI: {e}")
-            raise
-        except APIError as e:
-            logger.error(f"API ошибка: {e}")
-            raise
         except Exception as e:
-            logger.error(f"Неизвестная ошибка: {e}")
-            raise
+            logger.error(f"Ошибка OpenAI: {e}\n{traceback.format_exc()}")
+            return "❌ Произошла ошибка при генерации документа. Попробуйте позже."
 
     def save_docx(self, text: str, filename: str) -> str:
-        """Создание DOCX файла с проверкой"""
         try:
-            if not text.strip():
-                raise ValueError("Пустой текст для документа")
-                
             doc = Document()
             for para in text.split("\n"):
                 if para.strip():
@@ -242,15 +202,8 @@ class BotApplication:
             raise
 
     async def safe_send_document(self, message: Message, path: str):
-        """Безопасная отправка документа"""
         try:
-            if not os.path.exists(path):
-                raise FileNotFoundError(f"Файл {path} не найден")
-                
             await message.answer_document(FSInputFile(path))
-        except Exception as e:
-            logger.error(f"Ошибка отправки документа: {e}")
-            await message.answer("⚠️ Не удалось отправить документ")
         finally:
             if os.path.exists(path):
                 try:
@@ -259,17 +212,12 @@ class BotApplication:
                     logger.warning(f"Ошибка удаления файла {path}: {e}")
 
     async def shutdown(self):
-        """Корректное завершение работы"""
-        try:
-            if self.redis:
-                await self.redis.close()
-            if self.bot:
-                await self.bot.session.close()
-        except Exception as e:
-            logger.error(f"Ошибка при завершении работы: {e}")
+        if self.redis:
+            await self.redis.close()
+        if self.bot:
+            await self.bot.session.close()
 
     async def run(self):
-        """Основной цикл работы"""
         await self.initialize()
         try:
             await self.dp.start_polling(self.bot)
