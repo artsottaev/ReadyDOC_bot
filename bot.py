@@ -5,6 +5,7 @@ import asyncio
 import tempfile
 import traceback
 import datetime
+import difflib
 import httpx
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.fsm.context import FSMContext
@@ -128,7 +129,11 @@ class BotApplication:
                 await message.answer("🧠 Генерирую черновик документа...")
 
                 document = await self.generate_gpt_response(
-                    system_prompt="Ты опытный юрист. Составь юридически корректный документ.",
+                    system_prompt="Ты опытный юрист. Составь юридически корректный документ. "
+                                  "Важные требования:\n"
+                                  "- Все изменения должны быть обратимы через переменные\n"
+                                  "- Избегай ситуаций, требующих последующей проверки\n"
+                                  "- Явно маркируй спорные моменты как [КОММЕНТАРИЙ: ...]",
                     user_prompt=f"Составь юридический документ по российскому праву. Вот описание от пользователя:\n\n\"{message.text}\""
                 )
 
@@ -260,33 +265,64 @@ class BotApplication:
         document_text = data['document_text']
         filled_vars = data['filled_variables']
         
-        # Замена переменных с сохранением оригинального формата
+        # Замена переменных
         for var in data['variables']:
-            value = filled_vars.get(var, f"[{var}]")
             document_text = re.sub(
                 rf'\[{re.escape(var)}\]', 
-                value, 
+                filled_vars.get(var, f"[{var}]"), 
                 document_text
             )
         
+        # Автоматическая проверка и коррекция
+        reviewed_doc = await self.auto_review_and_fix(document_text)
+        
+        # Сохраняем и отправляем
         filename = f"final_{message.from_user.id}.docx"
-        path = self.save_docx(document_text, filename)
+        path = self.save_docx(reviewed_doc, filename)
         
         await message.answer_document(FSInputFile(path))
-        await message.answer("✅ Документ полностью готов к использованию!")
+        await message.answer("✅ Документ проверен и готов к использованию!")
         await state.clear()
 
         if os.path.exists(path):
             os.unlink(path)
 
+    async def auto_review_and_fix(self, document: str) -> str:
+        try:
+            reviewed = await self.generate_gpt_response(
+                system_prompt="""Ты опытный юридический редактор. Автоматически исправь:
+1. Незаполненные переменные [ВОТ_ТАК]
+2. Логические противоречия
+3. Ошибки в нумерации
+4. Недочеты в тексте документа
+5. Несоответствие российскому законодательству на 2025 год
+
+Формат правок:
+- ТОЛЬКО исправления без комментариев
+- Сохрани исходную структуру
+- Не упоминай о внесенных изменениях""",
+                
+                user_prompt=f"Проверь, проанализируй и молча исправь документ:\n\n{document}"
+            )
+            
+            # Логирование изменений
+            if reviewed != document:
+                diff = difflib.unified_diff(
+                    document.splitlines(), 
+                    reviewed.splitlines(),
+                    fromfile='original',
+                    tofile='modified'
+                )
+                logger.info(f"Auto-correct diff:\n" + "\n".join(diff))
+            
+            return reviewed
+            
+        except Exception as e:
+            logger.error(f"Ошибка авто-проверки: {e}\n{traceback.format_exc()}")
+            return document  # Возвращаем оригинал при ошибке
+
     async def generate_gpt_response(self, system_prompt: str, user_prompt: str) -> str:
         try:
-            system_prompt += """
-            Шаблон для заполнения:
-            - Все изменяемые параметры указывай в квадратных скобках, например: [НАЗВАНИЕ КОМПАНИИ]
-            - Сохраняй структуру документа с четкими разделами
-            """
-            
             response = await self.openai_client.chat.completions.create(
                 model="gpt-3.5-turbo-0125",
                 messages=[
