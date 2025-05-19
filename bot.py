@@ -7,11 +7,12 @@ import traceback
 import datetime
 import difflib
 import httpx
+from contextlib import asynccontextmanager
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.redis import RedisStorage
-from aiogram.enums import ParseMode
+from aiogram.enums import ParseMode, ChatAction
 from aiogram.types import (
     Message, 
     FSInputFile, 
@@ -41,6 +42,7 @@ class BotApplication:
         self.redis = None
         self.openai_client = None
         self.states = None
+        self.current_chat_id = None
 
     async def initialize(self):
         # Очистка переменных окружения прокси
@@ -103,6 +105,28 @@ class BotApplication:
         # Регистрация обработчиков
         self.register_handlers()
 
+    @asynccontextmanager
+    async def show_loading(self, chat_id: int, action: str = ChatAction.TYPING):
+        """Контекстный менеджер для отображения индикатора загрузки"""
+        self.current_chat_id = chat_id
+        stop_event = asyncio.Event()
+        
+        async def loading_animation():
+            while not stop_event.is_set():
+                await self.bot.send_chat_action(chat_id, action)
+                try:
+                    await asyncio.wait_for(stop_event.wait(), timeout=4.9)
+                except asyncio.TimeoutError:
+                    continue
+        
+        loader_task = asyncio.create_task(loading_animation())
+        try:
+            yield
+        finally:
+            stop_event.set()
+            await loader_task
+            self.current_chat_id = None
+
     def register_handlers(self):
         @self.dp.message(F.text == "/start")
         async def cmd_start(message: Message, state: FSMContext):
@@ -126,16 +150,17 @@ class BotApplication:
                     return
 
                 await state.update_data(initial_text=message.text)
-                await message.answer("🧠 Генерирую черновик документа...")
-
-                document = await self.generate_gpt_response(
-                    system_prompt="Ты опытный юрист. Составь юридически корректный документ. "
-                                  "Важные требования:\n"
-                                  "- Все изменения должны быть обратимы через переменные\n"
-                                  "- Избегай ситуаций, требующих последующей проверки\n"
-                                  "- Явно маркируй спорные моменты как [КОММЕНТАРИЙ: ...]",
-                    user_prompt=f"Составь юридический документ по российскому праву. Вот описание от пользователя:\n\n\"{message.text}\""
-                )
+                
+                async with self.show_loading(message.chat.id, ChatAction.UPLOAD_DOCUMENT):
+                    await message.answer("🧠 Генерирую черновик документа...")
+                    document = await self.generate_gpt_response(
+                        system_prompt="Ты опытный юрист. Составь юридически корректный документ. "
+                                      "Важные требования:\n"
+                                      "- Все изменения должны быть обратимы через переменные\n"
+                                      "- Избегай ситуаций, требующих последующей проверки\n"
+                                      "- Явно маркируй спорные моменты как [КОММЕНТАРИЙ: ...]",
+                        user_prompt=f"Составь юридический документ по российскому праву. Вот описание от пользователя:\n\n\"{message.text}\""
+                    )
 
                 filename = f"draft_{message.from_user.id}.docx"
                 path = self.save_docx(document, filename)
@@ -163,14 +188,15 @@ class BotApplication:
                     await self.start_variable_filling(message, state)
                     return
 
-                await message.answer("🔧 Вношу изменения...")
-                updated_doc = await self.generate_gpt_response(
-                    system_prompt="Ты юридический редактор. Вноси только необходимые правки, сохраняя стиль.",
-                    user_prompt=(
-                        "Вот документ. Добавь в него аккуратно следующие особые условия, "
-                        f"сохранив стиль и структуру:\n\nУсловия: {message.text}\n\nДокумент:\n{base_text}"
+                async with self.show_loading(message.chat.id, ChatAction.TYPING):
+                    await message.answer("🔧 Вношу изменения...")
+                    updated_doc = await self.generate_gpt_response(
+                        system_prompt="Ты юридический редактор. Вноси только необходимые правки, сохраняя стиль.",
+                        user_prompt=(
+                            "Вот документ. Добавь в него аккуратно следующие особые условия, "
+                            f"сохранив стиль и структуру:\n\nУсловия: {message.text}\n\nДокумент:\n{base_text}"
+                        )
                     )
-                )
 
                 await state.update_data(document_text=updated_doc)
                 await self.start_variable_filling(message, state)
@@ -274,7 +300,8 @@ class BotApplication:
             )
         
         # Автоматическая проверка и коррекция
-        reviewed_doc = await self.auto_review_and_fix(document_text)
+        async with self.show_loading(message.chat.id, ChatAction.UPLOAD_DOCUMENT):
+            reviewed_doc = await self.auto_review_and_fix(document_text)
         
         # Сохраняем и отправляем
         filename = f"final_{message.from_user.id}.docx"
@@ -289,21 +316,21 @@ class BotApplication:
 
     async def auto_review_and_fix(self, document: str) -> str:
         try:
-            reviewed = await self.generate_gpt_response(
-                system_prompt="""Ты опытный юридический редактор. Автоматически исправь:
+            async with self.show_loading(self.current_chat_id, ChatAction.TYPING):
+                reviewed = await self.generate_gpt_response(
+                    system_prompt="""Ты юридический редактор-невидимка. Автоматически исправь:
 1. Незаполненные переменные [ВОТ_ТАК]
 2. Логические противоречия
 3. Ошибки в нумерации
-4. Недочеты в тексте документа
-5. Несоответствие российскому законодательству на 2025 год
+4. Несоответствие российскому законодательству
 
 Формат правок:
 - ТОЛЬКО исправления без комментариев
 - Сохрани исходную структуру
 - Не упоминай о внесенных изменениях""",
-                
-                user_prompt=f"Проверь, проанализируй и молча исправь документ:\n\n{document}"
-            )
+                    
+                    user_prompt=f"Проверь и молча исправь документ:\n\n{document}"
+                )
             
             # Логирование изменений
             if reviewed != document:
@@ -323,15 +350,16 @@ class BotApplication:
 
     async def generate_gpt_response(self, system_prompt: str, user_prompt: str) -> str:
         try:
-            response = await self.openai_client.chat.completions.create(
-                model="gpt-3.5-turbo-0125",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                temperature=0.3,
-                max_tokens=3000
-            )
+            async with self.show_loading(self.current_chat_id, ChatAction.TYPING):
+                response = await self.openai_client.chat.completions.create(
+                    model="gpt-3.5-turbo-0125",
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    temperature=0.3,
+                    max_tokens=3000
+                )
             return response.choices[0].message.content.strip()
         except Exception as e:
             logger.error(f"Ошибка OpenAI: {e}\n{traceback.format_exc()}")
