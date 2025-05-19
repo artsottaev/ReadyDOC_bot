@@ -3,13 +3,14 @@ import logging
 import asyncio
 import tempfile
 import traceback
+import datetime
 import httpx
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.redis import RedisStorage
 from aiogram.enums import ParseMode
-from aiogram.types import Message, FSInputFile
+from aiogram.types import Message, FSInputFile, ReplyKeyboardRemove
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
 from docx import Document
@@ -87,6 +88,12 @@ class BotApplication:
         class DocGenState(StatesGroup):
             waiting_for_initial_input = State()
             waiting_for_special_terms = State()
+            contract_place = State()
+            contract_party1 = State()
+            contract_party2 = State()
+            contract_date = State()
+            contract_signatory1 = State()
+            contract_signatory2 = State()
         
         self.states = DocGenState
 
@@ -127,9 +134,11 @@ class BotApplication:
                 path = self.save_docx(document, filename)
                 
                 await state.update_data(document_text=document)
-                await message.answer("📄 Вот сгенерированный документ:")
-                await self.safe_send_document(message, path)
-                await message.answer("Хочешь добавить особые условия? Напиши их или напиши <b>нет</b>.")
+                await message.answer_document(FSInputFile(path))
+                await message.answer(
+                    "📄 Черновик документа готов! Теперь нужно заполнить обязательные поля.\n"
+                    "Хочешь добавить особые условия? Напиши их или напиши <b>нет</b>."
+                )
                 await state.set_state(self.states.waiting_for_special_terms)
                 
             except Exception as e:
@@ -144,8 +153,7 @@ class BotApplication:
                 base_text = data.get("document_text", "")
 
                 if message.text.strip().lower() == "нет":
-                    await message.answer("✅ Документ завершён. Удачи!")
-                    await state.clear()
+                    await self.request_contract_details(message, state)
                     return
 
                 await message.answer("🔧 Вношу изменения...")
@@ -157,23 +165,123 @@ class BotApplication:
                     )
                 )
 
-                filename = f"final_{message.from_user.id}.docx"
-                path = self.save_docx(updated_doc, filename)
-                
-                await message.answer("📄 Документ с учётом условий:")
-                await self.safe_send_document(message, path)
-                await message.answer("✅ Готово!")
-                await state.clear()
+                await state.update_data(document_text=updated_doc)
+                await self.request_contract_details(message, state)
                 
             except Exception as e:
                 logger.error(f"Ошибка обработки условий: {e}\n{traceback.format_exc()}")
                 await message.answer("⚠️ Произошла ошибка при обработке условий. Попробуйте снова.")
                 await state.clear()
 
+        async def request_contract_details(self, message: Message, state: FSMContext):
+            await state.set_state(self.states.contract_place)
+            await message.answer(
+                "📍 Введите место заключения договора (город):",
+                reply_markup=ReplyKeyboardRemove()
+            )
+
+        @self.dp.message(self.states.contract_place)
+        async def handle_place(message: Message, state: FSMContext):
+            await state.update_data(place=message.text)
+            await state.set_state(self.states.contract_party1)
+            await message.answer("👤 Введите полное название Стороны 1 (например: ООО 'Ромашка'):")
+
+        @self.dp.message(self.states.contract_party1)
+        async def handle_party1(message: Message, state: FSMContext):
+            await state.update_data(party1=message.text)
+            await state.set_state(self.states.contract_party2)
+            await message.answer("👤 Введите полное название Стороны 2 (например: ИП Иванов И.И.):")
+
+        @self.dp.message(self.states.contract_party2)
+        async def handle_party2(message: Message, state: FSMContext):
+            await state.update_data(party2=message.text)
+            await state.set_state(self.states.contract_date)
+            await message.answer("📅 Введите дату договора в формате ДД.ММ.ГГГГ:")
+
+        @self.dp.message(self.states.contract_date)
+        async def handle_date(message: Message, state: FSMContext):
+            try:
+                datetime.datetime.strptime(message.text, '%d.%m.%Y')
+                await state.update_data(date=message.text)
+                await state.set_state(self.states.contract_signatory1)
+                await message.answer("📝 Введите ФИО и должность подписанта от Стороны 1:")
+            except ValueError:
+                await message.answer("❌ Неверный формат даты! Используйте ДД.ММ.ГГГГ")
+
+        @self.dp.message(self.states.contract_signatory1)
+        async def handle_signatory1(message: Message, state: FSMContext):
+            await state.update_data(signatory1=message.text)
+            await state.set_state(self.states.contract_signatory2)
+            await message.answer("📝 Введите ФИО и должность подписанта от Стороны 2:")
+
+        @self.dp.message(self.states.contract_signatory2)
+        async def handle_signatory2(message: Message, state: FSMContext):
+            try:
+                await state.update_data(signatory2=message.text)
+                data = await state.get_data()
+                
+                # Генерация финального документа
+                await message.answer("🔄 Создаю финальную версию документа...")
+                final_doc = self.fill_contract_template(
+                    data['document_text'],
+                    data.get('place', '______'),
+                    data.get('party1', '______'),
+                    data.get('party2', '______'),
+                    data.get('date', '______'),
+                    data.get('signatory1', '______'),
+                    data.get('signatory2', '______')
+                )
+                
+                filename = f"final_{message.from_user.id}.docx"
+                path = self.save_docx(final_doc, filename)
+                
+                await message.answer_document(FSInputFile(path))
+                await message.answer(
+                    "✅ Документ готов к печати и подписанию!\n"
+                    "Для создания нового документа используйте /start"
+                )
+                await state.clear()
+
+            except Exception as e:
+                logger.error(f"Ошибка финальной генерации: {e}\n{traceback.format_exc()}")
+                await message.answer("⚠️ Произошла ошибка при создании документа. Попробуйте снова.")
+                await state.clear()
+
+            finally:
+                if os.path.exists(path):
+                    os.unlink(path)
+
+    def fill_contract_template(self, text: str, place: str, party1: str, party2: str, 
+                             date: str, signatory1: str, signatory2: str) -> str:
+        replacements = {
+            '[МЕСТО]': place,
+            '[СТОРОНА_1]': party1,
+            '[СТОРОНА_2]': party2,
+            '[ДАТА]': date,
+            '[ПОДПИСАНТ_1]': signatory1,
+            '[ПОДПИСАНТ_2]': signatory2,
+            '  ': ' '  # Убираем двойные пробелы после замены
+        }
+        
+        for key, value in replacements.items():
+            text = text.replace(key, value)
+        
+        return text
+
     async def generate_gpt_response(self, system_prompt: str, user_prompt: str) -> str:
         try:
+            system_prompt += """
+            Шаблон для заполнения:
+            - Место заключения: [МЕСТО]
+            - Сторона 1: [СТОРОНА_1]
+            - Сторона 2: [СТОРОНА_2]
+            - Дата: [ДАТА]
+            - Подпись Стороны 1: ___________________/[ПОДПИСАНТ_1]/
+            - Подпись Стороны 2: ___________________/[ПОДПИСАНТ_2]/
+            """
+            
             response = await self.openai_client.chat.completions.create(
-                model="gpt-3.5-turbo-0125",  # Единственное изменение в коде
+                model="gpt-3.5-turbo-0125",
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
@@ -201,21 +309,14 @@ class BotApplication:
             logger.error(f"Ошибка создания DOCX: {e}\n{traceback.format_exc()}")
             raise
 
-    async def safe_send_document(self, message: Message, path: str):
-        try:
-            await message.answer_document(FSInputFile(path))
-        finally:
-            if os.path.exists(path):
-                try:
-                    os.unlink(path)
-                except Exception as e:
-                    logger.warning(f"Ошибка удаления файла {path}: {e}")
-
     async def shutdown(self):
-        if self.redis:
-            await self.redis.close()
-        if self.bot:
-            await self.bot.session.close()
+        try:
+            if self.redis:
+                await self.redis.close()
+            if self.bot:
+                await self.bot.session.close()
+        except Exception as e:
+            logger.error(f"Ошибка при завершении работы: {e}")
 
     async def run(self):
         await self.initialize()
