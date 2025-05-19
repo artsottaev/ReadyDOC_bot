@@ -1,4 +1,5 @@
 import os
+import re
 import logging
 import asyncio
 import tempfile
@@ -10,7 +11,13 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.redis import RedisStorage
 from aiogram.enums import ParseMode
-from aiogram.types import Message, FSInputFile, ReplyKeyboardRemove
+from aiogram.types import (
+    Message, 
+    FSInputFile, 
+    ReplyKeyboardRemove,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton
+)
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
 from docx import Document
@@ -88,12 +95,8 @@ class BotApplication:
         class DocGenState(StatesGroup):
             waiting_for_initial_input = State()
             waiting_for_special_terms = State()
-            contract_place = State()
-            contract_party1 = State()
-            contract_party2 = State()
-            contract_date = State()
-            contract_signatory1 = State()
-            contract_signatory2 = State()
+            filling_variables = State()
+            current_variable = State()
         
         self.states = DocGenState
 
@@ -153,7 +156,7 @@ class BotApplication:
                 base_text = data.get("document_text", "")
 
                 if message.text.strip().lower() == "нет":
-                    await self.request_contract_details(message, state)
+                    await self.start_variable_filling(message, state)
                     return
 
                 await message.answer("🔧 Вношу изменения...")
@@ -166,118 +169,123 @@ class BotApplication:
                 )
 
                 await state.update_data(document_text=updated_doc)
-                await self.request_contract_details(message, state)
+                await self.start_variable_filling(message, state)
                 
             except Exception as e:
                 logger.error(f"Ошибка обработки условий: {e}\n{traceback.format_exc()}")
                 await message.answer("⚠️ Произошла ошибка при обработке условий. Попробуйте снова.")
                 await state.clear()
 
-        async def request_contract_details(self, message: Message, state: FSMContext):
-            await state.set_state(self.states.contract_place)
+        async def start_variable_filling(self, message: Message, state: FSMContext):
+            data = await state.get_data()
+            document_text = data['document_text']
+            
+            variables = list(set(re.findall(r'\[(.*?)\]', document_text)))
+            
+            await state.update_data(
+                variables=variables,
+                filled_variables={},
+                current_variable_index=0
+            )
+            
+            await self.ask_next_variable(message, state)
+
+        async def ask_next_variable(self, message: Message, state: FSMContext):
+            data = await state.get_data()
+            variables = data['variables']
+            index = data['current_variable_index']
+            
+            if index >= len(variables):
+                await self.finalize_document(message, state)
+                return
+                
+            current_var = variables[index]
+            await state.set_state(self.states.current_variable)
+            
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="⏭ Пропустить", callback_data="skip_variable")
+            ]])
+            
             await message.answer(
-                "📍 Введите место заключения договора (город):",
-                reply_markup=ReplyKeyboardRemove()
+                f"✍️ Введите значение для переменной <b>{current_var}</b>:",
+                reply_markup=keyboard
             )
 
-        @self.dp.message(self.states.contract_place)
-        async def handle_place(message: Message, state: FSMContext):
-            await state.update_data(place=message.text)
-            await state.set_state(self.states.contract_party1)
-            await message.answer("👤 Введите полное название Стороны 1 (например: ООО 'Ромашка'):")
+        @self.dp.callback_query(F.data == "skip_variable")
+        async def handle_skip_variable(callback: types.CallbackQuery, state: FSMContext):
+            data = await state.get_data()
+            index = data['current_variable_index'] + 1
+            await state.update_data(current_variable_index=index)
+            await callback.message.delete()
+            await self.ask_next_variable(callback.message, state)
 
-        @self.dp.message(self.states.contract_party1)
-        async def handle_party1(message: Message, state: FSMContext):
-            await state.update_data(party1=message.text)
-            await state.set_state(self.states.contract_party2)
-            await message.answer("👤 Введите полное название Стороны 2 (например: ИП Иванов И.И.):")
+        @self.dp.message(self.states.current_variable)
+        async def handle_variable_input(message: Message, state: FSMContext):
+            data = await state.get_data()
+            variables = data['variables']
+            index = data['current_variable_index']
+            current_var = variables[index]
+            
+            # Валидация ввода
+            error = None
+            value = message.text
+            
+            if current_var.upper() == "ИНН":
+                if not value.isdigit() or len(value) not in [10, 12]:
+                    error = "❌ Неверный формат ИНН! Должно быть 10 или 12 цифр"
+            elif "ДАТА" in current_var.upper():
+                try:
+                    datetime.datetime.strptime(value, '%d.%m.%Y')
+                except ValueError:
+                    error = "❌ Неверный формат даты! Используйте ДД.ММ.ГГГГ"
+            elif "СУММА" in current_var.upper():
+                if not value.replace(' ', '').replace(',', '.').replace('.', '', 1).isdigit():
+                    error = "❌ Неверный формат суммы! Пример: 15000 или 12 345,67"
+            
+            if error:
+                await message.answer(error)
+                return
 
-        @self.dp.message(self.states.contract_party2)
-        async def handle_party2(message: Message, state: FSMContext):
-            await state.update_data(party2=message.text)
-            await state.set_state(self.states.contract_date)
-            await message.answer("📅 Введите дату договора в формате ДД.ММ.ГГГГ:")
+            filled = data['filled_variables']
+            filled[current_var] = value
+            
+            await state.update_data(
+                filled_variables=filled,
+                current_variable_index=index + 1
+            )
+            
+            await self.ask_next_variable(message, state)
 
-        @self.dp.message(self.states.contract_date)
-        async def handle_date(message: Message, state: FSMContext):
-            try:
-                datetime.datetime.strptime(message.text, '%d.%m.%Y')
-                await state.update_data(date=message.text)
-                await state.set_state(self.states.contract_signatory1)
-                await message.answer("📝 Введите ФИО и должность подписанта от Стороны 1:")
-            except ValueError:
-                await message.answer("❌ Неверный формат даты! Используйте ДД.ММ.ГГГГ")
-
-        @self.dp.message(self.states.contract_signatory1)
-        async def handle_signatory1(message: Message, state: FSMContext):
-            await state.update_data(signatory1=message.text)
-            await state.set_state(self.states.contract_signatory2)
-            await message.answer("📝 Введите ФИО и должность подписанта от Стороны 2:")
-
-        @self.dp.message(self.states.contract_signatory2)
-        async def handle_signatory2(message: Message, state: FSMContext):
-            try:
-                await state.update_data(signatory2=message.text)
-                data = await state.get_data()
-                
-                # Генерация финального документа
-                await message.answer("🔄 Создаю финальную версию документа...")
-                final_doc = self.fill_contract_template(
-                    data['document_text'],
-                    data.get('place', '______'),
-                    data.get('party1', '______'),
-                    data.get('party2', '______'),
-                    data.get('date', '______'),
-                    data.get('signatory1', '______'),
-                    data.get('signatory2', '______')
+        async def finalize_document(self, message: Message, state: FSMContext):
+            data = await state.get_data()
+            document_text = data['document_text']
+            filled_vars = data['filled_variables']
+            
+            # Замена переменных с сохранением оригинального формата
+            for var in data['variables']:
+                value = filled_vars.get(var, f"[{var}]")
+                document_text = re.sub(
+                    rf'\[{re.escape(var)}\]', 
+                    value, 
+                    document_text
                 )
-                
-                filename = f"final_{message.from_user.id}.docx"
-                path = self.save_docx(final_doc, filename)
-                
-                await message.answer_document(FSInputFile(path))
-                await message.answer(
-                    "✅ Документ готов к печати и подписанию!\n"
-                    "Для создания нового документа используйте /start"
-                )
-                await state.clear()
+            
+            filename = f"final_{message.from_user.id}.docx"
+            path = self.save_docx(document_text, filename)
+            
+            await message.answer_document(FSInputFile(path))
+            await message.answer("✅ Документ полностью готов к использованию!")
+            await state.clear()
 
-            except Exception as e:
-                logger.error(f"Ошибка финальной генерации: {e}\n{traceback.format_exc()}")
-                await message.answer("⚠️ Произошла ошибка при создании документа. Попробуйте снова.")
-                await state.clear()
-
-            finally:
-                if os.path.exists(path):
-                    os.unlink(path)
-
-    def fill_contract_template(self, text: str, place: str, party1: str, party2: str, 
-                             date: str, signatory1: str, signatory2: str) -> str:
-        replacements = {
-            '[МЕСТО]': place,
-            '[СТОРОНА_1]': party1,
-            '[СТОРОНА_2]': party2,
-            '[ДАТА]': date,
-            '[ПОДПИСАНТ_1]': signatory1,
-            '[ПОДПИСАНТ_2]': signatory2,
-            '  ': ' '  # Убираем двойные пробелы после замены
-        }
-        
-        for key, value in replacements.items():
-            text = text.replace(key, value)
-        
-        return text
+            if os.path.exists(path):
+                os.unlink(path)
 
     async def generate_gpt_response(self, system_prompt: str, user_prompt: str) -> str:
         try:
             system_prompt += """
             Шаблон для заполнения:
-            - Место заключения: [МЕСТО]
-            - Сторона 1: [СТОРОНА_1]
-            - Сторона 2: [СТОРОНА_2]
-            - Дата: [ДАТА]
-            - Подпись Стороны 1: ___________________/[ПОДПИСАНТ_1]/
-            - Подпись Стороны 2: ___________________/[ПОДПИСАНТ_2]/
+            - Все изменяемые параметры указывай в квадратных скобках, например: [НАЗВАНИЕ КОМПАНИИ]
+            - Сохраняй структуру документа с четкими разделами
             """
             
             response = await self.openai_client.chat.completions.create(
