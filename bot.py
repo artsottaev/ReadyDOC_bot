@@ -95,7 +95,6 @@ class BotApplication:
         class DocGenState(StatesGroup):
             waiting_for_initial_input = State()
             waiting_for_special_terms = State()
-            filling_variables = State()
             current_variable = State()
         
         self.states = DocGenState
@@ -176,41 +175,6 @@ class BotApplication:
                 await message.answer("⚠️ Произошла ошибка при обработке условий. Попробуйте снова.")
                 await state.clear()
 
-        async def start_variable_filling(self, message: Message, state: FSMContext):
-            data = await state.get_data()
-            document_text = data['document_text']
-            
-            variables = list(set(re.findall(r'\[(.*?)\]', document_text)))
-            
-            await state.update_data(
-                variables=variables,
-                filled_variables={},
-                current_variable_index=0
-            )
-            
-            await self.ask_next_variable(message, state)
-
-        async def ask_next_variable(self, message: Message, state: FSMContext):
-            data = await state.get_data()
-            variables = data['variables']
-            index = data['current_variable_index']
-            
-            if index >= len(variables):
-                await self.finalize_document(message, state)
-                return
-                
-            current_var = variables[index]
-            await state.set_state(self.states.current_variable)
-            
-            keyboard = InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="⏭ Пропустить", callback_data="skip_variable")
-            ]])
-            
-            await message.answer(
-                f"✍️ Введите значение для переменной <b>{current_var}</b>:",
-                reply_markup=keyboard
-            )
-
         @self.dp.callback_query(F.data == "skip_variable")
         async def handle_skip_variable(callback: types.CallbackQuery, state: FSMContext):
             data = await state.get_data()
@@ -256,29 +220,64 @@ class BotApplication:
             
             await self.ask_next_variable(message, state)
 
-        async def finalize_document(self, message: Message, state: FSMContext):
-            data = await state.get_data()
-            document_text = data['document_text']
-            filled_vars = data['filled_variables']
-            
-            # Замена переменных с сохранением оригинального формата
-            for var in data['variables']:
-                value = filled_vars.get(var, f"[{var}]")
-                document_text = re.sub(
-                    rf'\[{re.escape(var)}\]', 
-                    value, 
-                    document_text
-                )
-            
-            filename = f"final_{message.from_user.id}.docx"
-            path = self.save_docx(document_text, filename)
-            
-            await message.answer_document(FSInputFile(path))
-            await message.answer("✅ Документ полностью готов к использованию!")
-            await state.clear()
+    async def start_variable_filling(self, message: Message, state: FSMContext):
+        data = await state.get_data()
+        document_text = data['document_text']
+        
+        variables = list(set(re.findall(r'\[(.*?)\]', document_text)))
+        
+        await state.update_data(
+            variables=variables,
+            filled_variables={},
+            current_variable_index=0
+        )
+        
+        await self.ask_next_variable(message, state)
 
-            if os.path.exists(path):
-                os.unlink(path)
+    async def ask_next_variable(self, message: Message, state: FSMContext):
+        data = await state.get_data()
+        variables = data['variables']
+        index = data['current_variable_index']
+        
+        if index >= len(variables):
+            await self.finalize_document(message, state)
+            return
+            
+        current_var = variables[index]
+        await state.set_state(self.states.current_variable)
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="⏭ Пропустить", callback_data="skip_variable")
+        ]])
+        
+        await message.answer(
+            f"✍️ Введите значение для переменной <b>{current_var}</b>:",
+            reply_markup=keyboard
+        )
+
+    async def finalize_document(self, message: Message, state: FSMContext):
+        data = await state.get_data()
+        document_text = data['document_text']
+        filled_vars = data['filled_variables']
+        
+        # Замена переменных с сохранением оригинального формата
+        for var in data['variables']:
+            value = filled_vars.get(var, f"[{var}]")
+            document_text = re.sub(
+                rf'\[{re.escape(var)}\]', 
+                value, 
+                document_text
+            )
+        
+        filename = f"final_{message.from_user.id}.docx"
+        path = self.save_docx(document_text, filename)
+        
+        await message.answer_document(FSInputFile(path))
+        await message.answer("✅ Документ полностью готов к использованию!")
+        await state.clear()
+
+        if os.path.exists(path):
+            os.unlink(path)
 
     async def generate_gpt_response(self, system_prompt: str, user_prompt: str) -> str:
         try:
