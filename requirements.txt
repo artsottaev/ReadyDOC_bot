@@ -8,3 +8,7 @@ aiofiles==23.2.1
 redis==5.0.0
 httpx==0.27.0
 httpcore==1.0.5
+natasha==1.5.0
+spacy==3.7.4
+ru-core-news-md @ https://github.com/explosion/spacy-models/releases/download/ru_core_news_md-3.7.0/ru_core_news_md-3.7.0.tar.gz
+python-Levenshtein==0.25.0

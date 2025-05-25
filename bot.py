@@ -24,6 +24,12 @@ from openai import AsyncOpenAI
 from dotenv import load_dotenv
 from docx import Document
 from redis.asyncio import Redis
+from natasha import (
+    NamesExtractor,
+    OrganisationExtractor,
+    MorphVocab,
+    Doc
+)
 
 # Настройка логирования
 logging.basicConfig(
@@ -43,14 +49,13 @@ class BotApplication:
         self.openai_client = None
         self.states = None
         self.current_chat_id = None
+        self.morph_vocab = MorphVocab()
 
     async def initialize(self):
-        # Очистка переменных окружения прокси
         os.environ.pop("HTTP_PROXY", None)
         os.environ.pop("HTTPS_PROXY", None)
         os.environ.pop("ALL_PROXY", None)
 
-        # Валидация переменных окружения
         BOT_TOKEN = os.getenv("BOT_TOKEN")
         OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
         REDIS_URL = os.getenv("REDIS_URL")
@@ -61,7 +66,6 @@ class BotApplication:
                 "BOT_TOKEN, OPENAI_API_KEY, REDIS_URL"
             )
 
-        # Инициализация OpenAI клиента
         self.openai_client = AsyncOpenAI(
             api_key=OPENAI_API_KEY,
             http_client=httpx.AsyncClient(
@@ -74,7 +78,6 @@ class BotApplication:
             )
         )
 
-        # Инициализация Redis
         self.redis = Redis.from_url(
             REDIS_URL,
             socket_timeout=10,
@@ -84,40 +87,63 @@ class BotApplication:
             health_check_interval=30
         )
         
-        # Проверка подключения к Redis
         if not await self.redis.ping():
             raise ConnectionError("Не удалось подключиться к Redis")
 
         storage = RedisStorage(redis=self.redis)
-
-        # Инициализация бота и диспетчера
         self.bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
         self.dp = Dispatcher(storage=storage)
 
-        # Определение состояний FSM
         class DocGenState(StatesGroup):
             waiting_for_initial_input = State()
             waiting_for_special_terms = State()
             current_variable = State()
         
         self.states = DocGenState
-
-        # Регистрация обработчиков
         self.register_handlers()
+
+    def extract_entities(self, text: str) -> dict:
+        doc = Doc(text)
+        doc.segment(self.morph_vocab)
+        
+        org_extractor = OrganisationExtractor()
+        name_extractor = NamesExtractor()
+        
+        doc.orgs = org_extractor(doc)
+        doc.names = name_extractor(doc)
+        
+        return {
+            'organisations': [org.fact.as_dict for org in doc.orgs],
+            'names': [name.fact.as_dict for name in doc.names]
+        }
+
+    def is_requisite(self, context: str, entity_type: str) -> bool:
+        keywords = {
+            'organisations': ['арендодатель', 'арендатор', 'сторона', 'организация'],
+            'names': ['директор', 'представитель', 'лицо', 'подпись']
+        }
+        return any(kw in context.lower() for kw in keywords[entity_type])
+
+    async def validate_inn(self, inn: str):
+        async with httpx.AsyncClient() as client:
+            try:
+                response = await client.get(
+                    f"https://service.nalog.ru/inn-proc.do?inn={inn}",
+                    timeout=10
+                )
+                return response.status_code == 200
+            except Exception:
+                return False
 
     @asynccontextmanager
     async def show_loading(self, chat_id: int, action: str = ChatAction.TYPING):
-        """Контекстный менеджер для отображения индикатора загрузки"""
         self.current_chat_id = chat_id
         stop_event = asyncio.Event()
         
         async def loading_animation():
             while not stop_event.is_set():
                 await self.bot.send_chat_action(chat_id, action)
-                try:
-                    await asyncio.wait_for(stop_event.wait(), timeout=4.9)
-                except asyncio.TimeoutError:
-                    continue
+                await asyncio.sleep(4.9)
         
         loader_task = asyncio.create_task(loading_animation())
         try:
@@ -154,12 +180,12 @@ class BotApplication:
                 async with self.show_loading(message.chat.id, ChatAction.UPLOAD_DOCUMENT):
                     await message.answer("🧠 Генерирую черновик документа...")
                     document = await self.generate_gpt_response(
-                        system_prompt="Ты опытный юрист. Составь юридически корректный документ. "
-                                      "Важные требования:\n"
-                                      "- Все изменения должны быть обратимы через переменные\n"
-                                      "- Избегай ситуаций, требующих последующей проверки\n"
-                                      "- Явно маркируй спорные моменты как [КОММЕНТАРИЙ: ...]",
-                        user_prompt=f"Составь юридический документ по российскому праву. Вот описание от пользователя:\n\n\"{message.text}\""
+                        system_prompt="""Ты опытный юрист. Составь юридически корректный документ. 
+                        Обязательно явно указывай:
+                        - Названия организаций в формате [НАЗВАНИЕ_ОРГАНИЗАЦИИ_1]
+                        - ФИО ответственных лиц: [ФИО_1]
+                        - Контактные данные: [ТЕЛЕФОН_1], [АДРЕС_1]""",
+                        user_prompt=f"Составь документ по описанию:\n\n{message.text}"
                     )
 
                 filename = f"draft_{message.from_user.id}.docx"
@@ -168,14 +194,14 @@ class BotApplication:
                 await state.update_data(document_text=document)
                 await message.answer_document(FSInputFile(path))
                 await message.answer(
-                    "📄 Черновик документа готов! Теперь нужно заполнить обязательные поля.\n"
-                    "Хочешь добавить особые условия? Напиши их или напиши <b>нет</b>."
+                    "📄 Черновик готов! Теперь заполним обязательные поля.\n"
+                    "Хочешь добавить особые условия? Напиши их или 'нет'."
                 )
                 await state.set_state(self.states.waiting_for_special_terms)
                 
             except Exception as e:
-                logger.error(f"Ошибка обработки описания: {e}\n{traceback.format_exc()}")
-                await message.answer("⚠️ Произошла ошибка при обработке запроса. Попробуйте снова.")
+                logger.error(f"Ошибка обработки: {e}\n{traceback.format_exc()}")
+                await message.answer("⚠️ Ошибка обработки. Попробуйте снова.")
                 await state.clear()
 
         @self.dp.message(self.states.waiting_for_special_terms)
@@ -191,19 +217,16 @@ class BotApplication:
                 async with self.show_loading(message.chat.id, ChatAction.TYPING):
                     await message.answer("🔧 Вношу изменения...")
                     updated_doc = await self.generate_gpt_response(
-                        system_prompt="Ты юридический редактор. Вноси только необходимые правки, сохраняя стиль.",
-                        user_prompt=(
-                            "Вот документ. Добавь в него аккуратно следующие особые условия, "
-                            f"сохранив стиль и структуру:\n\nУсловия: {message.text}\n\nДокумент:\n{base_text}"
-                        )
+                        system_prompt="Ты юридический редактор. Вноси правки, сохраняя стиль.",
+                        user_prompt=f"Добавь условия в документ:\n{message.text}\n\nДокумент:\n{base_text}"
                     )
 
                 await state.update_data(document_text=updated_doc)
                 await self.start_variable_filling(message, state)
                 
             except Exception as e:
-                logger.error(f"Ошибка обработки условий: {e}\n{traceback.format_exc()}")
-                await message.answer("⚠️ Произошла ошибка при обработке условий. Попробуйте снова.")
+                logger.error(f"Ошибка обработки: {e}\n{traceback.format_exc()}")
+                await message.answer("⚠️ Ошибка обработки. Попробуйте снова.")
                 await state.clear()
 
         @self.dp.callback_query(F.data == "skip_variable")
@@ -221,21 +244,24 @@ class BotApplication:
             index = data['current_variable_index']
             current_var = variables[index]
             
-            # Валидация ввода
-            error = None
             value = message.text
+            error = None
+
+            if current_var.startswith('ИНН'):
+                if not (value.isdigit() and len(value) in (10, 12)):
+                    error = "❌ Неверный формат ИНН"
+                elif not await self.validate_inn(value):
+                    error = "❌ Недействительный ИНН"
             
-            if current_var.upper() == "ИНН":
-                if not value.isdigit() or len(value) not in [10, 12]:
-                    error = "❌ Неверный формат ИНН! Должно быть 10 или 12 цифр"
-            elif "ДАТА" in current_var.upper():
+            elif current_var.startswith('ТЕЛЕФОН'):
+                if not re.match(r'^\+7\d{10}$', value):
+                    error = "❌ Формат: +7XXXXXXXXXX"
+            
+            elif current_var.startswith('ДАТА'):
                 try:
                     datetime.datetime.strptime(value, '%d.%m.%Y')
                 except ValueError:
-                    error = "❌ Неверный формат даты! Используйте ДД.ММ.ГГГГ"
-            elif "СУММА" in current_var.upper():
-                if not value.replace(' ', '').replace(',', '.').replace('.', '', 1).isdigit():
-                    error = "❌ Неверный формат суммы! Пример: 15000 или 12 345,67"
+                    error = "❌ Формат даты: ДД.ММ.ГГГГ"
             
             if error:
                 await message.answer(error)
@@ -243,26 +269,35 @@ class BotApplication:
 
             filled = data['filled_variables']
             filled[current_var] = value
-            
             await state.update_data(
                 filled_variables=filled,
                 current_variable_index=index + 1
             )
-            
             await self.ask_next_variable(message, state)
 
     async def start_variable_filling(self, message: Message, state: FSMContext):
         data = await state.get_data()
         document_text = data['document_text']
         
-        variables = list(set(re.findall(r'\[(.*?)\]', document_text)))
+        explicit_vars = list(set(re.findall(r'\[(.*?)\]', document_text)))
+        entities = self.extract_entities(document_text)
+        
+        implicit_vars = []
+        for i, org in enumerate(entities['organisations'], 1):
+            if self.is_requisite(org['fact'].as_json, 'organisations'):
+                implicit_vars.append(f"НАЗВАНИЕ_ОРГАНИЗАЦИИ_{i}")
+        
+        for i, name in enumerate(entities['names'], 1):
+            if self.is_requisite(name['fact'].as_json, 'names'):
+                implicit_vars.append(f"ФИО_{i}")
+        
+        all_vars = list(set(explicit_vars + implicit_vars))
         
         await state.update_data(
-            variables=variables,
+            variables=all_vars,
             filled_variables={},
             current_variable_index=0
         )
-        
         await self.ask_next_variable(message, state)
 
     async def ask_next_variable(self, message: Message, state: FSMContext):
@@ -282,7 +317,7 @@ class BotApplication:
         ]])
         
         await message.answer(
-            f"✍️ Введите значение для переменной <b>{current_var}</b>:",
+            f"✍️ Введите значение для <b>{current_var}</b>:",
             reply_markup=keyboard
         )
 
@@ -291,7 +326,6 @@ class BotApplication:
         document_text = data['document_text']
         filled_vars = data['filled_variables']
         
-        # Замена переменных
         for var in data['variables']:
             document_text = re.sub(
                 rf'\[{re.escape(var)}\]', 
@@ -299,16 +333,23 @@ class BotApplication:
                 document_text
             )
         
-        # Автоматическая проверка и коррекция
+        entities = self.extract_entities(document_text)
+        for i, org in enumerate(entities['organisations'], 1):
+            var_name = f"НАЗВАНИЕ_ОРГАНИЗАЦИИ_{i}"
+            if var_name in filled_vars:
+                document_text = document_text.replace(
+                    org['fact'].name, 
+                    filled_vars[var_name]
+                )
+        
         async with self.show_loading(message.chat.id, ChatAction.UPLOAD_DOCUMENT):
             reviewed_doc = await self.auto_review_and_fix(document_text)
         
-        # Сохраняем и отправляем
         filename = f"final_{message.from_user.id}.docx"
         path = self.save_docx(reviewed_doc, filename)
         
         await message.answer_document(FSInputFile(path))
-        await message.answer("✅ Документ проверен и готов к использованию!")
+        await message.answer("✅ Документ готов!")
         await state.clear()
 
         if os.path.exists(path):
@@ -318,21 +359,10 @@ class BotApplication:
         try:
             async with self.show_loading(self.current_chat_id, ChatAction.TYPING):
                 reviewed = await self.generate_gpt_response(
-                    system_prompt="""Ты юридический редактор-невидимка. Автоматически исправь:
-1. Незаполненные переменные [ВОТ_ТАК]
-2. Логические противоречия
-3. Ошибки в нумерации
-4. Несоответствие российскому законодательству
-
-Формат правок:
-- ТОЛЬКО исправления без комментариев
-- Сохрани исходную структуру
-- Не упоминай о внесенных изменениях""",
-                    
-                    user_prompt=f"Проверь и молча исправь документ:\n\n{document}"
+                    system_prompt="Исправь ошибки и незаполненные поля в документе",
+                    user_prompt=f"Документ для проверки:\n\n{document}"
                 )
             
-            # Логирование изменений
             if reviewed != document:
                 diff = difflib.unified_diff(
                     document.splitlines(), 
@@ -340,13 +370,12 @@ class BotApplication:
                     fromfile='original',
                     tofile='modified'
                 )
-                logger.info(f"Auto-correct diff:\n" + "\n".join(diff))
+                logger.info(f"Изменения:\n{'\n'.join(diff)}")
             
             return reviewed
-            
         except Exception as e:
-            logger.error(f"Ошибка авто-проверки: {e}\n{traceback.format_exc()}")
-            return document  # Возвращаем оригинал при ошибке
+            logger.error(f"Ошибка проверки: {e}")
+            return document
 
     async def generate_gpt_response(self, system_prompt: str, user_prompt: str) -> str:
         try:
@@ -362,8 +391,8 @@ class BotApplication:
                 )
             return response.choices[0].message.content.strip()
         except Exception as e:
-            logger.error(f"Ошибка OpenAI: {e}\n{traceback.format_exc()}")
-            return "❌ Произошла ошибка при генерации документа. Попробуйте позже."
+            logger.error(f"Ошибка OpenAI: {e}")
+            return "❌ Ошибка генерации. Попробуйте позже."
 
     def save_docx(self, text: str, filename: str) -> str:
         try:
@@ -377,7 +406,7 @@ class BotApplication:
             doc.save(filepath)
             return filepath
         except Exception as e:
-            logger.error(f"Ошибка создания DOCX: {e}\n{traceback.format_exc()}")
+            logger.error(f"Ошибка создания DOCX: {e}")
             raise
 
     async def shutdown(self):
@@ -387,14 +416,14 @@ class BotApplication:
             if self.bot:
                 await self.bot.session.close()
         except Exception as e:
-            logger.error(f"Ошибка при завершении работы: {e}")
+            logger.error(f"Ошибка завершения: {e}")
 
     async def run(self):
         await self.initialize()
         try:
             await self.dp.start_polling(self.bot)
         except Exception as e:
-            logger.critical(f"Критическая ошибка: {str(e)}\n{traceback.format_exc()}")
+            logger.critical(f"Критическая ошибка: {e}")
         finally:
             await self.shutdown()
 
@@ -405,4 +434,4 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logger.info("Бот остановлен")
     except Exception as e:
-        logger.critical(f"Фатальная ошибка: {str(e)}\n{traceback.format_exc()}")
+        logger.critical(f"Фатальная ошибка: {e}")
