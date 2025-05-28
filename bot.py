@@ -26,7 +26,7 @@ from docx import Document
 from redis.asyncio import Redis
 from natasha import (
     NamesExtractor,
-    OrganisationExtractor,
+    OrgExtractor,  # Изменено с OrganisationExtractor
     MorphVocab,
     Doc
 )
@@ -106,8 +106,9 @@ class BotApplication:
         doc = Doc(text)
         doc.segment(self.morph_vocab)
         
-        org_extractor = OrganisationExtractor()
-        name_extractor = NamesExtractor()
+        # Исправленный вызов OrgExtractor
+        org_extractor = OrgExtractor(self.morph_vocab)
+        name_extractor = NamesExtractor(self.morph_vocab)
         
         doc.orgs = org_extractor(doc)
         doc.names = name_extractor(doc)
@@ -284,11 +285,13 @@ class BotApplication:
         
         implicit_vars = []
         for i, org in enumerate(entities['organisations'], 1):
-            if self.is_requisite(org['fact'].as_json, 'organisations'):
+            # Проверка контекста для организаций
+            if 'name' in org and self.is_requisite(org['name'], 'organisations'):
                 implicit_vars.append(f"НАЗВАНИЕ_ОРГАНИЗАЦИИ_{i}")
         
         for i, name in enumerate(entities['names'], 1):
-            if self.is_requisite(name['fact'].as_json, 'names'):
+            # Проверка контекста для имен
+            if 'first' in name and self.is_requisite(name['first'], 'names'):
                 implicit_vars.append(f"ФИО_{i}")
         
         all_vars = list(set(explicit_vars + implicit_vars))
@@ -326,6 +329,7 @@ class BotApplication:
         document_text = data['document_text']
         filled_vars = data['filled_variables']
         
+        # Замена явных переменных
         for var in data['variables']:
             document_text = re.sub(
                 rf'\[{re.escape(var)}\]', 
@@ -333,12 +337,13 @@ class BotApplication:
                 document_text
             )
         
+        # Замена сущностей
         entities = self.extract_entities(document_text)
         for i, org in enumerate(entities['organisations'], 1):
             var_name = f"НАЗВАНИЕ_ОРГАНИЗАЦИИ_{i}"
-            if var_name in filled_vars:
+            if var_name in filled_vars and 'name' in org:
                 document_text = document_text.replace(
-                    org['fact'].name, 
+                    org['name'], 
                     filled_vars[var_name]
                 )
         
