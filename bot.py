@@ -105,12 +105,126 @@ class BotApplication:
             waiting_for_initial_input = State()
             current_variable = State()
             document_review = State()
-            waiting_for_special_terms = State()  # Перенесли в конец
+            waiting_for_special_terms = State()
         
         self.states = DocGenState
         self.register_handlers()
 
-    # ... (остальные методы без изменений до register_handlers) ...
+    def extract_entities(self, text: str) -> dict:
+        doc = Doc(text)
+        doc.segment(self.segmenter)
+        doc.tag_morph(self.morph_tagger)
+        doc.parse_syntax(self.syntax_parser)
+        doc.tag_ner(self.ner_tagger)
+        
+        organisations = []
+        names = []
+        
+        for span in doc.spans:
+            if span.type == "ORG":
+                organisations.append(span.text)
+            elif span.type == "PER":
+                names.append(span.text)
+        
+        return {
+            'organisations': organisations,
+            'names': names
+        }
+
+    async def identify_roles(self, document_text: str) -> dict:
+        """Используем ИИ для определения ролей участников договора"""
+        try:
+            response = await self.generate_gpt_response(
+                system_prompt="""Ты юридический ассистент. Определи роли участников договора и их реквизиты.
+                Ответь в формате JSON:
+                {
+                    "roles": {
+                        "Роль1": {
+                            "fields": ["ТИП_ДАННЫХ_1", "ТИП_ДАННЫХ_2"]
+                        },
+                        "Роль2": {
+                            "fields": ["ТИП_ДАННЫХ_3"]
+                        }
+                    },
+                    "field_descriptions": {
+                        "ТИП_ДАННЫХ_1": "Человекочитаемое описание"
+                    }
+                }
+                Пример: 
+                {
+                    "roles": {
+                        "Арендодатель": {
+                            "fields": ["НАЗВАНИЕ_ОРГАНИЗАЦИИ", "ИНН", "АДРЕС"]
+                        },
+                        "Арендатор": {
+                            "fields": ["ФИО", "ПАСПОРТ"]
+                        }
+                    },
+                    "field_descriptions": {
+                        "НАЗВАНИЕ_ОРГАНИЗАЦИИ": "официальное наименование компании",
+                        "ФИО": "полное имя генерального директора"
+                    }
+                }""",
+                user_prompt=f"Документ:\n{document_text}",
+                chat_id=None
+            )
+            
+            # Извлекаем JSON из ответа
+            json_match = re.search(r'\{.*\}', response, re.DOTALL)
+            if json_match:
+                return json.loads(json_match.group(0))
+            return {"roles": {}, "field_descriptions": {}}
+        except Exception as e:
+            logger.error("Ошибка определения ролей: %s", e)
+            return {"roles": {}, "field_descriptions": {}}
+
+    def map_variable_to_question(self, var_name: str, role_info: dict) -> str:
+        """Улучшенное формирование вопросов с использованием ИИ"""
+        # Ищем к какой роли относится поле
+        role = None
+        for role_name, role_data in role_info.get("roles", {}).items():
+            if var_name in role_data.get("fields", []):
+                role = role_name
+                break
+        
+        # Пробуем получить описание из field_descriptions
+        description = role_info.get("field_descriptions", {}).get(var_name, var_name.replace("_", " ").lower())
+        
+        # Формируем понятный вопрос
+        if role:
+            return f"✍️ Введите <b>{description}</b> для <b>{role}</b>:"
+        return f"✍️ Введите <b>{description}</b>:"
+
+    def validate_inn(self, inn: str) -> bool:
+        """Упрощенная проверка ИНН (только формат)"""
+        return inn.isdigit() and len(inn) in (10, 12)
+
+    @asynccontextmanager
+    async def show_loading(self, chat_id: int, action: str = ChatAction.TYPING):
+        """Исправленный контекстный менеджер для показа статуса загрузки"""
+        if chat_id is None:
+            yield
+            return
+            
+        stop_event = asyncio.Event()
+        
+        async def loading_animation():
+            while not stop_event.is_set():
+                try:
+                    await self.bot.send_chat_action(chat_id, action)
+                except Exception as e:
+                    logger.error("Ошибка отправки действия: %s", e)
+                await asyncio.sleep(4.9)
+        
+        loader_task = asyncio.create_task(loading_animation())
+        try:
+            yield
+        finally:
+            stop_event.set()
+            try:
+                await loader_task
+            except:
+                pass
 
     def register_handlers(self):
         @self.dp.message(F.text == "/start")
@@ -171,8 +285,6 @@ class BotApplication:
                 await message.answer("⚠️ Ошибка обработки. Попробуйте снова.")
                 await state.clear()
 
-        # Убираем старый обработчик для waiting_for_special_terms
-
         @self.dp.callback_query(F.data == "skip_variable")
         async def handle_skip_variable(callback: types.CallbackQuery, state: FSMContext):
             data = await state.get_data()
@@ -183,11 +295,83 @@ class BotApplication:
 
         @self.dp.callback_query(F.data == "dont_know")
         async def handle_dont_know(callback: types.CallbackQuery, state: FSMContext):
-            # ... (без изменений) ...
+            data = await state.get_data()
+            current_var = data['variables'][data['current_variable_index']]
+            
+            # Предлагаем варианты для пропущенных значений
+            suggestions = {
+                "дата": datetime.datetime.now().strftime("%d.%m.%Y"),
+                "телефон": "+79990001122",
+                "инн": "1234567890" if "организации" in current_var.lower() else "123456789012",
+                "паспорт": "4510 123456",
+                "сумма": "10 000",
+                "срок": "1 год",
+                "адрес": "г. Москва, ул. Ленина, д. 1",
+                "огрн": "1234567890123"
+            }
+            
+            # Ищем подходящий вариант
+            for pattern, value in suggestions.items():
+                if pattern in current_var.lower():
+                    await callback.message.answer(
+                        f"⚠️ Вы можете использовать временное значение:\n"
+                        f"<code>{value}</code>\n\n"
+                        f"Позже его нужно будет заменить на актуальное!"
+                    )
+                    return
+            
+            await callback.message.answer(
+                "⚠️ Это обязательное поле. Если информация неизвестна, "
+                "введите <code>НЕТ ДАННЫХ</code> и уточните позже"
+            )
 
         @self.dp.message(self.states.current_variable)
         async def handle_variable_input(message: Message, state: FSMContext):
-            # ... (без изменений) ...
+            data = await state.get_data()
+            variables = data['variables']
+            index = data['current_variable_index']
+            current_var = variables[index]
+            
+            value = message.text
+            error = None
+
+            if "инн" in current_var.lower():
+                if not self.validate_inn(value):
+                    error = "❌ Неверный формат ИНН (должно быть 10 или 12 цифр)"
+            
+            elif "телефон" in current_var.lower():
+                if not re.match(r'^\+7\d{10}$', value):
+                    error = "❌ Неверный формат телефона. Пример: +79998887766"
+            
+            elif "дата" in current_var.lower():
+                try:
+                    datetime.datetime.strptime(value, '%d.%m.%Y')
+                except ValueError:
+                    error = "❌ Неверный формат даты. Используйте ДД.ММ.ГГГГ"
+            
+            elif "паспорт" in current_var.lower():
+                if not re.match(r'^\d{4} \d{6}$', value):
+                    error = "❌ Неверный формат паспорта. Пример: 4510 123456"
+            
+            elif "сумма" in current_var.lower():
+                if not re.match(r'^[\d\s]+$', value):
+                    error = "❌ Неверный формат суммы. Используйте цифры (например: 10000 или 15 000)"
+            
+            elif "огрн" in current_var.lower():
+                if not re.match(r'^\d{13}$', value):
+                    error = "❌ Неверный формат ОГРН (должно быть 13 цифр)"
+            
+            if error:
+                await message.answer(error)
+                return
+
+            filled = data['filled_variables']
+            filled[current_var] = value
+            await state.update_data(
+                filled_variables=filled,
+                current_variable_index=index + 1
+            )
+            await self.ask_next_variable(message, state)
 
         @self.dp.callback_query(F.data == "confirm_document")
         async def handle_confirm_document(callback: types.CallbackQuery, state: FSMContext):
@@ -200,7 +384,6 @@ class BotApplication:
             await state.set_state(self.states.waiting_for_initial_input)
             await callback.message.answer("🔄 Введите новый запрос для генерации документа:")
 
-        # Новый обработчик для добавления условий в конце
         @self.dp.callback_query(F.data == "add_terms")
         async def handle_add_terms(callback: types.CallbackQuery, state: FSMContext):
             await callback.message.answer(
@@ -242,7 +425,106 @@ class BotApplication:
                 await message.answer("⚠️ Ошибка обработки. Попробуйте снова.")
                 await state.clear()
 
-    # ... (остальные методы без изменений) ...
+    async def start_variable_filling(self, message: Message, state: FSMContext):
+        data = await state.get_data()
+        document_text = data['document_text']
+        
+        # Используем ИИ для определения ролей и реквизитов
+        role_info = await self.identify_roles(document_text)
+        logger.info("Определенные роли: %s", json.dumps(role_info, indent=2, ensure_ascii=False))
+        
+        # Извлекаем все уникальные переменные
+        all_vars = list(set(re.findall(r'\[(.*?)\]', document_text)))
+        
+        # Группируем переменные по ролям
+        grouped_vars = {}
+        for var in all_vars:
+            # Определяем к какой роли относится переменная
+            role = "Общие"
+            for role_name, role_data in role_info.get("roles", {}).items():
+                if var in role_data.get("fields", []):
+                    role = role_name
+                    break
+                    
+            if role not in grouped_vars:
+                grouped_vars[role] = []
+            grouped_vars[role].append(var)
+        
+        # Создаем плоский список с сохранением порядка групп
+        ordered_vars = []
+        var_descriptions = {}
+        
+        # Сначала общие реквизиты
+        if "Общие" in grouped_vars:
+            for var in grouped_vars["Общие"]:
+                ordered_vars.append(var)
+                var_descriptions[var] = self.map_variable_to_question(var, role_info)
+        
+        # Затем специфичные для ролей
+        for role, vars_list in grouped_vars.items():
+            if role == "Общие":
+                continue
+                
+            # Добавляем разделитель
+            ordered_vars.append(f"---{role}---")
+            var_descriptions[f"---{role}---"] = f"🔹 <b>{role}</b>"
+            
+            for var in vars_list:
+                ordered_vars.append(var)
+                var_descriptions[var] = self.map_variable_to_question(var, role_info)
+        
+        # Логирование всех переменных
+        logger.info("Упорядоченные переменные: %s", ordered_vars)
+        
+        await state.update_data(
+            variables=ordered_vars,
+            var_descriptions=var_descriptions,
+            filled_variables={},
+            current_variable_index=0
+        )
+        await self.ask_next_variable(message, state)
+
+    async def ask_next_variable(self, message: Message, state: FSMContext):
+        data = await state.get_data()
+        variables = data['variables']
+        var_descriptions = data['var_descriptions']
+        index = data['current_variable_index']
+        
+        if index >= len(variables):
+            await self.prepare_final_document(message, state)
+            return
+            
+        current_var = variables[index]
+        
+        # Если это разделитель группы
+        if current_var.startswith("---"):
+            await message.answer(var_descriptions[current_var])
+            await state.update_data(current_variable_index=index + 1)
+            await self.ask_next_variable(message, state)
+            return
+            
+        description = var_descriptions[current_var]
+        
+        # Формируем клавиатуру с подсказками
+        keyboard_buttons = []
+        
+        # Добавляем кнопку пропуска
+        keyboard_buttons.append(
+            InlineKeyboardButton(text="⏭ Пропустить", callback_data="skip_variable")
+        )
+        
+        # Добавляем кнопку "Не знаю"
+        keyboard_buttons.append(
+            InlineKeyboardButton(text="❓ Не знаю", callback_data="dont_know")
+        )
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[keyboard_buttons])
+        
+        await state.set_state(self.states.current_variable)
+        await message.answer(
+            description,
+            reply_markup=keyboard
+        )
 
     async def prepare_final_document(self, message: Message, state: FSMContext):
         data = await state.get_data()
@@ -328,7 +610,87 @@ class BotApplication:
             if file_path and os.path.exists(file_path):
                 os.unlink(file_path)
 
-    # ... (остальные методы без изменений) ...
+    async def auto_review_and_fix(self, document: str, chat_id: int) -> str:
+        try:
+            async with self.show_loading(chat_id, ChatAction.TYPING):
+                reviewed = await self.generate_gpt_response(
+                    system_prompt="""Ты юридический редактор. Проверь документ на:
+                    1. Противоречивые условия
+                    2. Юридические неточности
+                    3. Опечатки и грамматические ошибки
+                    4. Конфликт интересов (один человек представляет обе стороны)
+                    5. Незаполненные обязательные реквизиты
+                    Верни исправленный документ в исходном формате.""",
+                    user_prompt=f"Проверь документ:\n\n{document}",
+                    chat_id=chat_id
+                )
+            
+            return reviewed
+        except Exception as e:
+            logger.error("Ошибка проверки: %s", e)
+            return document
+
+    async def generate_gpt_response(self, system_prompt: str, user_prompt: str, chat_id: int) -> str:
+        try:
+            if chat_id:
+                async with self.show_loading(chat_id, ChatAction.TYPING):
+                    response = await self.openai_client.chat.completions.create(
+                        model="gpt-3.5-turbo-0125",
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt}
+                        ],
+                        temperature=0.2,
+                        max_tokens=3000
+                    )
+            else:
+                response = await self.openai_client.chat.completions.create(
+                    model="gpt-3.5-turbo-0125",
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    temperature=0.2,
+                    max_tokens=3000
+                )
+                
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            logger.error("Ошибка OpenAI: %s", e)
+            return "❌ Ошибка генерации. Попробуйте позже."
+
+    def save_docx(self, text: str, filename: str) -> str:
+        try:
+            doc = Document()
+            for para in text.split("\n"):
+                if para.strip():
+                    doc.add_paragraph(para)
+            
+            temp_dir = tempfile.gettempdir()
+            filepath = os.path.join(temp_dir, filename)
+            doc.save(filepath)
+            return filepath
+        except Exception as e:
+            logger.error("Ошибка создания DOCX: %s", e)
+            raise
+
+    async def shutdown(self):
+        try:
+            if self.redis:
+                await self.redis.close()
+            if self.bot:
+                await self.bot.session.close()
+        except Exception as e:
+            logger.error("Ошибка завершения: %s", e)
+
+    async def run(self):
+        await self.initialize()
+        try:
+            await self.dp.start_polling(self.bot)
+        except Exception as e:
+            logger.critical("Критическая ошибка: %s", e)
+        finally:
+            await self.shutdown()
 
 if __name__ == "__main__":
     app = BotApplication()
