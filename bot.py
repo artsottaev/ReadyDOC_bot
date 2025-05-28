@@ -7,6 +7,7 @@ import traceback
 import datetime
 import difflib
 import httpx
+import json
 from contextlib import asynccontextmanager
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.fsm.context import FSMContext
@@ -16,7 +17,6 @@ from aiogram.enums import ParseMode, ChatAction
 from aiogram.types import (
     Message, 
     FSInputFile, 
-    ReplyKeyboardRemove,
     InlineKeyboardMarkup,
     InlineKeyboardButton
 )
@@ -50,7 +50,6 @@ class BotApplication:
         self.redis = None
         self.openai_client = None
         self.states = None
-        self.current_chat_id = None
         
         # Инициализация компонентов Natasha
         self.segmenter = Segmenter()
@@ -150,13 +149,13 @@ class BotApplication:
                         "Арендатор": ["ФИО", "ПАСПОРТ"]
                     }
                 }""",
-                user_prompt=f"Документ:\n{document_text}"
+                user_prompt=f"Документ:\n{document_text}",
+                chat_id=None  # Для системных вызовов без привязки к чату
             )
             
             # Извлекаем JSON из ответа
             json_match = re.search(r'\{.*\}', response, re.DOTALL)
             if json_match:
-                import json
                 return json.loads(json_match.group(0))
             return {"roles": {}}
         except Exception as e:
@@ -174,17 +173,19 @@ class BotApplication:
         
         # Основные шаблоны
         if "название_организации" in var_name.lower():
-            return f"Введите полное юридическое название организации {f'для {role}' if role else ''}"
+            return f"Введите полное юридическое название {f'{role}' if role else 'организации'}"
         elif "фио" in var_name.lower():
-            return f"Введите ФИО {f'для {role}' if role else ''} (полностью, в формате 'Иванов Иван Иванович')"
+            return f"Введите ФИО {f'{role}' if role else ''} (полностью, в формате 'Иванов Иван Иванович')"
         elif "телефон" in var_name.lower():
-            return f"Введите телефон {f'для {role}' if role else ''} в формате +7XXXXXXXXXX"
+            return f"Введите телефон {f'{role}' if role else ''} в формате +7XXXXXXXXXX"
         elif "адрес" in var_name.lower():
-            return f"Введите юридический адрес {f'для {role}' if role else ''} (с индексом)"
+            return f"Введите юридический адрес {f'{role}' if role else ''} (с индексом)"
         elif "инн" in var_name.lower():
-            return f"Введите ИНН {f'для {role}' if role else ''} (10 или 12 цифр)"
+            return f"Введите ИНН {f'{role}' if role else ''} (10 или 12 цифр)"
         elif "дата" in var_name.lower():
-            return f"Введите дату {f'для {role}' if role else ''} в формате ДД.ММ.ГГГГ"
+            return f"Введите дату {f'{role}' if role else ''} в формате ДД.ММ.ГГГГ"
+        elif "паспорт" in var_name.lower():
+            return f"Введите паспортные данные {f'{role}' if role else ''} (серия и номер)"
         
         # Общий случай
         name = var_name.replace("_", " ").lower()
@@ -203,12 +204,15 @@ class BotApplication:
 
     @asynccontextmanager
     async def show_loading(self, chat_id: int, action: str = ChatAction.TYPING):
-        self.current_chat_id = chat_id
+        """Исправленный контекстный менеджер для показа статуса загрузки"""
         stop_event = asyncio.Event()
         
         async def loading_animation():
             while not stop_event.is_set():
-                await self.bot.send_chat_action(chat_id, action)
+                try:
+                    await self.bot.send_chat_action(chat_id, action)
+                except Exception as e:
+                    logger.error("Ошибка отправки действия: %s", e)
                 await asyncio.sleep(4.9)
         
         loader_task = asyncio.create_task(loading_animation())
@@ -217,7 +221,6 @@ class BotApplication:
         finally:
             stop_event.set()
             await loader_task
-            self.current_chat_id = None
 
     def register_handlers(self):
         @self.dp.message(F.text == "/start")
@@ -252,7 +255,8 @@ class BotApplication:
                         - ФИО ответственных лиц: [ФИО_1]
                         - Контактные данные: [ТЕЛЕФОН_1], [АДРЕС_1]
                         - Другие реквизиты: [ИНН_1], [ПАСПОРТ_1]""",
-                        user_prompt=f"Составь документ по описанию:\n\n{message.text}"
+                        user_prompt=f"Составь документ по описанию:\n\n{message.text}",
+                        chat_id=message.chat.id
                     )
 
                 filename = f"draft_{message.from_user.id}.docx"
@@ -285,7 +289,8 @@ class BotApplication:
                     await message.answer("🔧 Вношу изменения...")
                     updated_doc = await self.generate_gpt_response(
                         system_prompt="Ты юридический редактор. Вноси правки, сохраняя стиль.",
-                        user_prompt=f"Добавь условия в документ:\n{message.text}\n\nДокумент:\n{base_text}"
+                        user_prompt=f"Добавь условия в документ:\n{message.text}\n\nДокумент:\n{base_text}",
+                        chat_id=message.chat.id
                     )
 
                 await state.update_data(document_text=updated_doc)
@@ -494,12 +499,12 @@ class BotApplication:
         
         async with self.show_loading(message.chat.id, ChatAction.UPLOAD_DOCUMENT):
             # Автоматическая проверка и фикс
-            reviewed_doc = await self.auto_review_and_fix(document_text)
+            reviewed_doc = await self.auto_review_and_fix(document_text, message.chat.id)
             
             # Проверка заполненности
             missing_vars = set(re.findall(r'\[(.*?)\]', reviewed_doc))
             if missing_vars:
-                await message.answer("⚠️ Остались незаполненные поля. Дополнительно проверьте документ.")
+                await message.answer(f"⚠️ Остались незаполненные поля: {', '.join(missing_vars)}")
         
         filename = f"final_{message.from_user.id}.docx"
         path = self.save_docx(reviewed_doc, filename)
@@ -511,16 +516,17 @@ class BotApplication:
         if os.path.exists(path):
             os.unlink(path)
 
-    async def auto_review_and_fix(self, document: str) -> str:
+    async def auto_review_and_fix(self, document: str, chat_id: int) -> str:
         try:
-            async with self.show_loading(self.current_chat_id, ChatAction.TYPING):
+            async with self.show_loading(chat_id, ChatAction.TYPING):
                 reviewed = await self.generate_gpt_response(
                     system_prompt="""Ты юридический редактор. Проверь документ на:
                     1. Незаполненные поля в квадратных скобках
                     2. Противоречивые условия
                     3. Юридические неточности
                     Если все в порядке, верни тот же текст""",
-                    user_prompt=f"Проверь документ:\n\n{document}"
+                    user_prompt=f"Проверь документ:\n\n{document}",
+                    chat_id=chat_id
                 )
             
             if reviewed != document:
@@ -537,9 +543,9 @@ class BotApplication:
             logger.error("Ошибка проверки: %s", e)
             return document
 
-    async def generate_gpt_response(self, system_prompt: str, user_prompt: str) -> str:
+    async def generate_gpt_response(self, system_prompt: str, user_prompt: str, chat_id: int) -> str:
         try:
-            async with self.show_loading(self.current_chat_id, ChatAction.TYPING):
+            async with self.show_loading(chat_id, ChatAction.TYPING) if chat_id else nullcontext():
                 response = await self.openai_client.chat.completions.create(
                     model="gpt-4-turbo",
                     messages=[
