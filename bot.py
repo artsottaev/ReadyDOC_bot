@@ -8,7 +8,7 @@ import datetime
 import difflib
 import httpx
 import json
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -140,6 +140,9 @@ class BotApplication:
                     "roles": {
                         "Роль1": ["ТИП_ДАННЫХ_1", "ТИП_ДАННЫХ_2", ...],
                         "Роль2": ["ТИП_ДАННЫХ_1", ...]
+                    },
+                    "field_descriptions": {
+                        "ТИП_ДАННЫХ_1": "Человекочитаемое описание"
                     }
                 }
                 Пример: 
@@ -147,22 +150,26 @@ class BotApplication:
                     "roles": {
                         "Арендодатель": ["НАЗВАНИЕ_ОРГАНИЗАЦИИ", "ИНН", "АДРЕС"],
                         "Арендатор": ["ФИО", "ПАСПОРТ"]
+                    },
+                    "field_descriptions": {
+                        "АДРЕС": "юридический адрес",
+                        "СУММА": "размер арендной платы"
                     }
                 }""",
                 user_prompt=f"Документ:\n{document_text}",
-                chat_id=None  # Для системных вызовов без привязки к чату
+                chat_id=None
             )
             
             # Извлекаем JSON из ответа
             json_match = re.search(r'\{.*\}', response, re.DOTALL)
             if json_match:
                 return json.loads(json_match.group(0))
-            return {"roles": {}}
+            return {"roles": {}, "field_descriptions": {}}
         except Exception as e:
             logger.error("Ошибка определения ролей: %s", e)
-            return {"roles": {}}
+            return {"roles": {}, "field_descriptions": {}}
 
-    async def map_variable_to_question(self, var_name: str, context: str, role_info: dict) -> str:
+    def map_variable_to_question(self, var_name: str, role_info: dict) -> str:
         """Улучшенное формирование вопросов с использованием ИИ"""
         # Сначала попробуем определить роль по контексту
         role = None
@@ -171,40 +178,56 @@ class BotApplication:
                 role = role_name
                 break
         
+        # Пробуем получить описание из field_descriptions
+        description = role_info.get("field_descriptions", {}).get(var_name, None)
+        
+        # Если есть кастомное описание - используем его
+        if description:
+            if role:
+                return f"Введите {description} для {role}"
+            return f"Введите {description}"
+        
         # Основные шаблоны
-        if "название_организации" in var_name.lower():
+        var_lower = var_name.lower()
+        
+        if "название" in var_lower or "организации" in var_lower:
             return f"Введите полное юридическое название {f'{role}' if role else 'организации'}"
-        elif "фио" in var_name.lower():
+        elif "фио" in var_lower:
             return f"Введите ФИО {f'{role}' if role else ''} (полностью, в формате 'Иванов Иван Иванович')"
-        elif "телефон" in var_name.lower():
+        elif "телефон" in var_lower:
             return f"Введите телефон {f'{role}' if role else ''} в формате +7XXXXXXXXXX"
-        elif "адрес" in var_name.lower():
+        elif "адрес" in var_lower:
             return f"Введите юридический адрес {f'{role}' if role else ''} (с индексом)"
-        elif "инн" in var_name.lower():
+        elif "инн" in var_lower:
             return f"Введите ИНН {f'{role}' if role else ''} (10 или 12 цифр)"
-        elif "дата" in var_name.lower():
+        elif "дата" in var_lower:
             return f"Введите дату {f'{role}' if role else ''} в формате ДД.ММ.ГГГГ"
-        elif "паспорт" in var_name.lower():
+        elif "паспорт" in var_lower:
             return f"Введите паспортные данные {f'{role}' if role else ''} (серия и номер)"
+        elif "сумма" in var_lower:
+            return f"Введите сумму {f'{role}' if role else ''} в рублях (например: 10000 или 15 000)"
+        elif "срок" in var_lower:
+            return f"Введите срок {f'{role}' if role else ''} (например: 1 год или 6 месяцев)"
+        elif "процент" in var_lower:
+            return f"Введите процентную ставку {f'{role}' if role else ''} (например: 5% или 10 процентов)"
         
         # Общий случай
         name = var_name.replace("_", " ").lower()
-        return f"Введите {name}{f' для {role}' if role else ''}"
+        if role:
+            return f"Введите {name} для {role}"
+        return f"Введите {name}"
 
-    async def validate_inn(self, inn: str):
-        async with httpx.AsyncClient() as client:
-            try:
-                response = await client.get(
-                    f"https://service.nalog.ru/inn-proc.do?inn={inn}",
-                    timeout=10
-                )
-                return response.status_code == 200
-            except Exception:
-                return False
+    def validate_inn(self, inn: str) -> bool:
+        """Упрощенная проверка ИНН (только формат)"""
+        return inn.isdigit() and len(inn) in (10, 12)
 
     @asynccontextmanager
     async def show_loading(self, chat_id: int, action: str = ChatAction.TYPING):
         """Исправленный контекстный менеджер для показа статуса загрузки"""
+        if chat_id is None:
+            yield
+            return
+            
         stop_event = asyncio.Event()
         
         async def loading_animation():
@@ -220,7 +243,10 @@ class BotApplication:
             yield
         finally:
             stop_event.set()
-            await loader_task
+            try:
+                await loader_task
+            except:
+                pass
 
     def register_handlers(self):
         @self.dp.message(F.text == "/start")
@@ -251,10 +277,11 @@ class BotApplication:
                     document = await self.generate_gpt_response(
                         system_prompt="""Ты опытный юрист. Составь юридически корректный документ. 
                         Обязательно явно указывай:
-                        - Названия организаций в формате [НАЗВАНИЕ_ОРГАНИЗАЦИИ_1]
-                        - ФИО ответственных лиц: [ФИО_1]
-                        - Контактные данные: [ТЕЛЕФОН_1], [АДРЕС_1]
-                        - Другие реквизиты: [ИНН_1], [ПАСПОРТ_1]""",
+                        - Названия организаций в формате [НАЗВАНИЕ_ОРГАНИЗАЦИИ]
+                        - ФИО ответственных лиц: [ФИО]
+                        - Контактные данные: [ТЕЛЕФОН], [АДРЕС]
+                        - Другие реквизиты: [ИНН], [ПАСПОРТ]
+                        - Суммы и сроки: [СУММА], [СРОК]""",
                         user_prompt=f"Составь документ по описанию:\n\n{message.text}",
                         chat_id=message.chat.id
                     )
@@ -319,7 +346,9 @@ class BotApplication:
                 "дата": datetime.datetime.now().strftime("%d.%m.%Y"),
                 "телефон": "+79990001122",
                 "инн": "1234567890" if "организации" in current_var.lower() else "123456789012",
-                "паспорт": "4510 123456 выдан ОВД г. Москвы 01.01.2020"
+                "паспорт": "4510 123456",
+                "сумма": "10 000",
+                "срок": "1 год"
             }
             
             # Ищем подходящий вариант
@@ -347,25 +376,27 @@ class BotApplication:
             value = message.text
             error = None
 
-            if current_var.startswith('ИНН'):
-                if not (value.isdigit() and len(value) in (10, 12)):
+            if "инн" in current_var.lower():
+                if not self.validate_inn(value):
                     error = "❌ Неверный формат ИНН (должно быть 10 или 12 цифр)"
-                elif not await self.validate_inn(value):
-                    error = "❌ Недействительный ИНН (проверка не прошла)"
             
-            elif current_var.startswith('ТЕЛЕФОН'):
+            elif "телефон" in current_var.lower():
                 if not re.match(r'^\+7\d{10}$', value):
                     error = "❌ Неверный формат телефона. Пример: +79998887766"
             
-            elif current_var.startswith('ДАТА'):
+            elif "дата" in current_var.lower():
                 try:
                     datetime.datetime.strptime(value, '%d.%m.%Y')
                 except ValueError:
                     error = "❌ Неверный формат даты. Используйте ДД.ММ.ГГГГ"
             
-            elif current_var.startswith('ПАСПОРТ'):
+            elif "паспорт" in current_var.lower():
                 if not re.match(r'^\d{4} \d{6}$', value):
                     error = "❌ Неверный формат паспорта. Пример: 4510 123456"
+            
+            elif "сумма" in current_var.lower():
+                if not re.match(r'^[\d\s]+$', value):
+                    error = "❌ Неверный формат суммы. Используйте цифры (например: 10000 или 15 000)"
             
             if error:
                 await message.answer(error)
@@ -385,7 +416,7 @@ class BotApplication:
         
         # Используем ИИ для определения ролей и реквизитов
         role_info = await self.identify_roles(document_text)
-        logger.info("Определенные роли: %s", role_info)
+        logger.info("Определенные роли: %s", json.dumps(role_info, indent=2, ensure_ascii=False))
         
         # Извлекаем все уникальные переменные
         all_vars = list(set(re.findall(r'\[(.*?)\]', document_text)))
@@ -412,7 +443,7 @@ class BotApplication:
         if "Общие" in grouped_vars:
             for var in grouped_vars["Общие"]:
                 ordered_vars.append(var)
-                var_descriptions[var] = await self.map_variable_to_question(var, document_text, role_info)
+                var_descriptions[var] = self.map_variable_to_question(var, role_info)
         
         # Затем специфичные для ролей
         for role, vars_list in grouped_vars.items():
@@ -425,7 +456,7 @@ class BotApplication:
             
             for var in vars_list:
                 ordered_vars.append(var)
-                var_descriptions[var] = await self.map_variable_to_question(var, document_text, role_info)
+                var_descriptions[var] = self.map_variable_to_question(var, role_info)
         
         # Логирование всех переменных
         logger.info("Упорядоченные переменные: %s", ordered_vars)
@@ -545,7 +576,18 @@ class BotApplication:
 
     async def generate_gpt_response(self, system_prompt: str, user_prompt: str, chat_id: int) -> str:
         try:
-            async with self.show_loading(chat_id, ChatAction.TYPING) if chat_id else nullcontext():
+            if chat_id:
+                async with self.show_loading(chat_id, ChatAction.TYPING):
+                    response = await self.openai_client.chat.completions.create(
+                        model="gpt-4-turbo",
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt}
+                        ],
+                        temperature=0.2,
+                        max_tokens=4000
+                    )
+            else:
                 response = await self.openai_client.chat.completions.create(
                     model="gpt-4-turbo",
                     messages=[
@@ -553,9 +595,9 @@ class BotApplication:
                         {"role": "user", "content": user_prompt}
                     ],
                     temperature=0.2,
-                    max_tokens=4000,
-                    response_format={"type": "text"}
+                    max_tokens=4000
                 )
+                
             return response.choices[0].message.content.strip()
         except Exception as e:
             logger.error("Ошибка OpenAI: %s", e)
