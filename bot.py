@@ -165,7 +165,7 @@ class BotApplication:
                 )
                 await state.set_state(self.states.waiting_for_initial_input)
             except Exception as e:
-                logger.error(f"Ошибка в /start: {e}\n{traceback.format_exc()}")
+                logger.error("Ошибка в /start: %s\n%s", e, traceback.format_exc())
                 await message.answer("⚠️ Произошла внутренняя ошибка. Попробуйте позже.")
 
         @self.dp.message(self.states.waiting_for_initial_input)
@@ -200,7 +200,7 @@ class BotApplication:
                 await state.set_state(self.states.waiting_for_special_terms)
                 
             except Exception as e:
-                logger.error(f"Ошибка обработки: {e}\n{traceback.format_exc()}")
+                logger.error("Ошибка обработки: %s\n%s", e, traceback.format_exc())
                 await message.answer("⚠️ Ошибка обработки. Попробуйте снова.")
                 await state.clear()
 
@@ -225,7 +225,7 @@ class BotApplication:
                 await self.start_variable_filling(message, state)
                 
             except Exception as e:
-                logger.error(f"Ошибка обработки: {e}\n{traceback.format_exc()}")
+                logger.error("Ошибка обработки: %s\n%s", e, traceback.format_exc())
                 await message.answer("⚠️ Ошибка обработки. Попробуйте снова.")
                 await state.clear()
 
@@ -370,11 +370,11 @@ class BotApplication:
                     fromfile='original',
                     tofile='modified'
                 )
-                logger.info(f"Изменения:\n{'\n'.join(diff)}")
+                logger.info("Изменения:\n%s", '\n'.join(diff))
             
             return reviewed
         except Exception as e:
-            logger.error(f"Ошибка проверки: {e}")
+            logger.error("Ошибка проверки: %s", e)
             return document
 
     async def generate_gpt_response(self, system_prompt: str, user_prompt: str) -> str:
@@ -391,7 +391,7 @@ class BotApplication:
                 )
             return response.choices[0].message.content.strip()
         except Exception as e:
-            logger.error(f"Ошибка OpenAI: {e}")
+            logger.error("Ошибка OpenAI: %s", e)
             return "❌ Ошибка генерации. Попробуйте позже."
 
     def save_docx(self, text: str, filename: str) -> str:
@@ -406,7 +406,7 @@ class BotApplication:
             doc.save(filepath)
             return filepath
         except Exception as e:
-            logger.error(f"Ошибка создания DOCX: {e}")
+            logger.error("Ошибка создания DOCX: %s", e)
             raise
 
     async def shutdown(self):
@@ -416,14 +416,14 @@ class BotApplication:
             if self.bot:
                 await self.bot.session.close()
         except Exception as e:
-            logger.error(f"Ошибка завершения: {e}")
+            logger.error("Ошибка завершения: %s", e)
 
     async def run(self):
         await self.initialize()
         try:
             await self.dp.start_polling(self.bot)
         except Exception as e:
-            logger.critical(f"Критическая ошибка: {e}")
+            logger.critical("Критическая ошибка: %s", e)
         finally:
             await self.shutdown()
 
@@ -434,4 +434,4 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logger.info("Бот остановлен")
     except Exception as e:
-        logger.critical(f"Фатальная ошибка: {e}")
+        logger.critical("Фатальная ошибка: %s", e)
