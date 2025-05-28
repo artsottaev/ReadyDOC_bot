@@ -173,6 +173,32 @@ class BotApplication:
             await loader_task
             self.current_chat_id = None
 
+    def map_variable_to_question(self, var_name: str, context: str) -> str:
+        """Преобразует техническое имя переменной в человекочитаемый вопрос"""
+        var_lower = var_name.lower()
+        
+        # Основные шаблоны
+        if "название_организации" in var_lower:
+            return "Введите полное юридическое название организации"
+        elif "фио" in var_lower:
+            return "Введите ФИО (полностью, в формате 'Иванов Иван Иванович')"
+        elif "телефон" in var_lower:
+            return "Введите телефон в формате +7XXXXXXXXXX"
+        elif "адрес" in var_lower:
+            return "Введите юридический адрес (с индексом)"
+        elif "инн" in var_lower:
+            return "Введите ИНН организации (10 или 12 цифр)"
+        elif "дата" in var_lower:
+            return "Введите дату в формате ДД.ММ.ГГГГ"
+        
+        # Автоматическое определение роли
+        role_match = re.search(r"арендодатель|арендатор|покупатель|продавец|заказчик|исполнитель", context.lower())
+        role = f" ({role_match.group(0)})" if role_match else ""
+        
+        # Общий случай
+        name = var_name.replace("_", " ").lower()
+        return f"Введите {name}{role}"
+
     def register_handlers(self):
         @self.dp.message(F.text == "/start")
         async def cmd_start(message: Message, state: FSMContext):
@@ -257,6 +283,33 @@ class BotApplication:
             await callback.message.delete()
             await self.ask_next_variable(callback.message, state)
 
+        @self.dp.callback_query(F.data == "dont_know")
+        async def handle_dont_know(callback: types.CallbackQuery, state: FSMContext):
+            data = await state.get_data()
+            current_var = data['variables'][data['current_variable_index']]
+            
+            # Предлагаем варианты для пропущенных значений
+            suggestions = {
+                "дата": datetime.datetime.now().strftime("%d.%m.%Y"),
+                "телефон": "+79990001122",
+                "инн": "1234567890" if "организации" in current_var.lower() else "123456789012"
+            }
+            
+            # Ищем подходящий вариант
+            for pattern, value in suggestions.items():
+                if pattern in current_var.lower():
+                    await callback.message.answer(
+                        f"⚠️ Вы можете использовать временное значение:\n"
+                        f"<code>{value}</code>\n\n"
+                        f"Позже его нужно будет заменить на актуальное!"
+                    )
+                    return
+            
+            await callback.message.answer(
+                "⚠️ Это обязательное поле. Если информация неизвестна, "
+                "введите <code>НЕТ ДАННЫХ</code> и уточните позже"
+            )
+
         @self.dp.message(self.states.current_variable)
         async def handle_variable_input(message: Message, state: FSMContext):
             data = await state.get_data()
@@ -320,8 +373,14 @@ class BotApplication:
         # Логирование всех переменных
         logger.info("Все переменные для заполнения: %s", all_vars)
         
+        # Создаем человекочитаемые описания
+        var_descriptions = {}
+        for var in all_vars:
+            var_descriptions[var] = self.map_variable_to_question(var, document_text)
+        
         await state.update_data(
             variables=all_vars,
+            var_descriptions=var_descriptions,  # Сохраняем описания
             filled_variables={},
             current_variable_index=0
         )
@@ -330,6 +389,7 @@ class BotApplication:
     async def ask_next_variable(self, message: Message, state: FSMContext):
         data = await state.get_data()
         variables = data['variables']
+        var_descriptions = data['var_descriptions']
         index = data['current_variable_index']
         
         if index >= len(variables):
@@ -337,14 +397,26 @@ class BotApplication:
             return
             
         current_var = variables[index]
-        await state.set_state(self.states.current_variable)
+        description = var_descriptions[current_var]
         
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+        # Формируем клавиатуру с подсказками
+        keyboard_buttons = []
+        
+        # Добавляем кнопку пропуска
+        keyboard_buttons.append(
             InlineKeyboardButton(text="⏭ Пропустить", callback_data="skip_variable")
-        ]])
+        )
         
+        # Добавляем кнопку "Не знаю"
+        keyboard_buttons.append(
+            InlineKeyboardButton(text="❓ Не знаю", callback_data="dont_know")
+        )
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[keyboard_buttons])
+        
+        await state.set_state(self.states.current_variable)
         await message.answer(
-            f"✍️ Введите значение для <b>{current_var}</b>:",
+            f"✍️ {description}:",
             reply_markup=keyboard
         )
 
