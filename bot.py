@@ -140,12 +140,10 @@ class BotApplication:
                 {
                     "roles": {
                         "Роль1": {
-                            "fields": ["ТИП_ДАННЫХ_1", "ТИП_ДАННЫХ_2"],
-                            "description": "Описание роли"
+                            "fields": ["ТИП_ДАННЫХ_1", "ТИП_ДАННЫХ_2"]
                         },
                         "Роль2": {
-                            "fields": ["ТИП_ДАННЫХ_3"],
-                            "description": "Описание роли"
+                            "fields": ["ТИП_ДАННЫХ_3"]
                         }
                     },
                     "field_descriptions": {
@@ -156,12 +154,10 @@ class BotApplication:
                 {
                     "roles": {
                         "Арендодатель": {
-                            "fields": ["НАЗВАНИЕ_ОРГАНИЗАЦИИ", "ИНН", "АДРЕС"],
-                            "description": "Собственник недвижимости"
+                            "fields": ["НАЗВАНИЕ_ОРГАНИЗАЦИИ", "ИНН", "АДРЕС"]
                         },
                         "Арендатор": {
-                            "fields": ["ФИО", "ПАСПОРТ"],
-                            "description": "Арендатор помещения"
+                            "fields": ["ФИО", "ПАСПОРТ"]
                         }
                     },
                     "field_descriptions": {
@@ -186,11 +182,9 @@ class BotApplication:
         """Улучшенное формирование вопросов с использованием ИИ"""
         # Ищем к какой роли относится поле
         role = None
-        role_description = ""
         for role_name, role_data in role_info.get("roles", {}).items():
             if var_name in role_data.get("fields", []):
                 role = role_name
-                role_description = role_data.get("description", "")
                 break
         
         # Пробуем получить описание из field_descriptions
@@ -198,8 +192,8 @@ class BotApplication:
         
         # Формируем понятный вопрос
         if role:
-            return f"Введите <b>{description}</b> для <b>{role}</b> ({role_description})"
-        return f"Введите <b>{description}</b>"
+            return f"✍️ Введите <b>{description}</b> для <b>{role}</b>:"
+        return f"✍️ Введите <b>{description}</b>:"
 
     def validate_inn(self, inn: str) -> bool:
         """Упрощенная проверка ИНН (только формат)"""
@@ -265,9 +259,7 @@ class BotApplication:
                         - ФИО ответственных лиц: [ФИО]
                         - Контактные данные: [ТЕЛЕФОН], [АДРЕС]
                         - Другие реквизиты: [ИНН], [ПАСПОРТ]
-                        - Суммы и сроки: [СУММА], [СРОК]
-                        Для каждой стороны договора явно указывай её роль в скобках:
-                        Пример: [НАЗВАНИЕ_ОРГАНИЗАЦИИ (Арендодатель)]""",
+                        - Суммы и сроки: [СУММА], [СРОК]""",
                         user_prompt=f"Составь документ по описанию:\n\n{message.text}",
                         chat_id=message.chat.id
                     )
@@ -334,7 +326,8 @@ class BotApplication:
                 "инн": "1234567890" if "организации" in current_var.lower() else "123456789012",
                 "паспорт": "4510 123456",
                 "сумма": "10 000",
-                "срок": "1 год"
+                "срок": "1 год",
+                "адрес": "г. Москва, ул. Ленина, д. 1"
             }
             
             # Ищем подходящий вариант
@@ -448,10 +441,8 @@ class BotApplication:
                 continue
                 
             # Добавляем разделитель
-            role_data = role_info["roles"].get(role, {})
-            role_desc = role_data.get("description", role)
             ordered_vars.append(f"---{role}---")
-            var_descriptions[f"---{role}---"] = f"🔹 <b>{role}</b> ({role_desc})"
+            var_descriptions[f"---{role}---"] = f"🔹 <b>{role}</b>"
             
             for var in vars_list:
                 ordered_vars.append(var)
@@ -506,7 +497,7 @@ class BotApplication:
         
         await state.set_state(self.states.current_variable)
         await message.answer(
-            f"✍️ {description}:",
+            description,
             reply_markup=keyboard
         )
 
@@ -590,7 +581,6 @@ class BotApplication:
                     1. Противоречивые условия
                     2. Юридические неточности
                     3. Опечатки и грамматические ошибки
-                    Исправь только найденные ошибки, не меняй структуру и не заполняй пропуски.
                     Верни исправленный документ в исходном формате.""",
                     user_prompt=f"Проверь документ:\n\n{document}",
                     chat_id=chat_id
@@ -606,23 +596,23 @@ class BotApplication:
             if chat_id:
                 async with self.show_loading(chat_id, ChatAction.TYPING):
                     response = await self.openai_client.chat.completions.create(
-                        model="gpt-4-turbo",
+                        model="gpt-3.5-turbo-0125",
                         messages=[
                             {"role": "system", "content": system_prompt},
                             {"role": "user", "content": user_prompt}
                         ],
                         temperature=0.2,
-                        max_tokens=4000
+                        max_tokens=3000
                     )
             else:
                 response = await self.openai_client.chat.completions.create(
-                    model="gpt-4-turbo",
+                    model="gpt-3.5-turbo-0125",
                     messages=[
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_prompt}
                     ],
                     temperature=0.2,
-                    max_tokens=4000
+                    max_tokens=3000
                 )
                 
             return response.choices[0].message.content.strip()
