@@ -113,23 +113,19 @@ class BotApplication:
     def extract_entities(self, text: str) -> dict:
         doc = Doc(text)
         doc.segment(self.segmenter)
-        doc.tag_morph(self.morph_tagger)
-        doc.parse_syntax(self.syntax_parser)
-        doc.tag_ner(self.ner_tagger)
+        doc.tag_ner(self.ner_tagger)  # Только NER-разметка
         
         organisations = []
-        names = []
         
         for span in doc.spans:
             if span.type == "ORG":
-                organisations.append(span.text)
-            elif span.type == "PER":
-                names.append(span.text)
+                # Используем нормализованное название
+                org_name = span.text
+                if span.normal:
+                    org_name = span.normal
+                organisations.append(org_name)
         
-        return {
-            'organisations': organisations,
-            'names': names
-        }
+        return {'organisations': organisations}
 
     async def identify_roles(self, document_text: str) -> dict:
         """Используем ИИ для определения ролей участников договора"""
@@ -256,15 +252,16 @@ class BotApplication:
                     # Улучшенный промпт для точного определения ролей
                     document = await self.generate_gpt_response(
                         system_prompt="""Ты опытный юрист. Составь юридически корректный документ. 
-                        Обязательно:
-                        1. Не делай предположений о ролях сторон (арендодатель/арендатор) без явных указаний
-                        2. Если роли не указаны явно, используй нейтральные названия: Сторона 1, Сторона 2
-                        3. Явно указывай:
-                           - Названия организаций в формате [НАЗВАНИЕ_ОРГАНИЗАЦИИ]
-                           - ФИО ответственных лиц: [ФИО]
-                           - Контактные данные: [ТЕЛЕФОН], [АДРЕС]
-                           - Другие реквизиты: [ИНН], [ОГРН], [ПАСПОРТ] для ИП, [ДОЛЖНОСТЬ] для ООО
-                           - Суммы и сроки: [СУММА], [СРОК]""",
+                        КРИТИЧЕСКИ ВАЖНЫЕ ПРАВИЛА:
+                        1. НИКОГДА не предполагай тип организации (ООО/ИП/ФЛ) без явного указания пользователя
+                        2. Если роли не указаны - используй строго нейтральные названия: Сторона 1, Сторона 2
+                        3. Для ВСЕХ сторон используй ОДИНАКОВЫЕ типы реквизитов:
+                           [НАЗВАНИЕ_ОРГАНИЗАЦИИ] для юр. лиц
+                           [ФИО] для физ. лиц
+                           [ПАСПОРТНЫЕ_ДАННЫЕ] для физ. лиц
+                        4. Все реквизиты должны быть в универсальном формате:
+                           [ИНН], [АДРЕС], [ТЕЛЕФОН], [ЭЛЕКТРОННАЯ_ПОЧТА]
+                        5. Никогда не заполняй реквизиты примерными значениями!""",
                         user_prompt=f"Составь документ по описанию:\n\n{message.text}",
                         chat_id=message.chat.id
                     )
@@ -360,6 +357,11 @@ class BotApplication:
             elif "огрн" in current_var.lower():
                 if not re.match(r'^\d{13}$', value):
                     error = "❌ Неверный формат ОГРН (должно быть 13 цифр)"
+            
+            # Новая валидация для названия организации
+            elif "название_организации" in current_var.lower():
+                if not re.match(r'^[\w\s"-]{5,}$', value, re.IGNORECASE | re.UNICODE):
+                    error = "❌ Название организации должно содержать минимум 5 символов"
             
             if error:
                 await message.answer(error)
@@ -590,42 +592,59 @@ class BotApplication:
     async def send_final_document(self, message: Message, state: FSMContext):
         data = await state.get_data()
         document_text = data.get('final_document', '')
-        path = data.get('document_path', '')
         
         if not document_text:
             await message.answer("⚠️ Ошибка: документ не найден")
             await state.clear()
             return
         
-        # Сохраняем финальную версию
-        filename = f"final_{message.from_user.id}.docx"
+        # Генерируем финальный DOCX
+        filename = f"Юридический_документ_{datetime.datetime.now().strftime('%d%m%Y')}.docx"
         final_path = self.save_docx(document_text, filename)
         
         await message.answer_document(FSInputFile(final_path))
-        await message.answer("✅ Документ готов! Проверьте его перед использованием.")
+        await message.answer(
+            "✅ Документ готов! Рекомендуем:\n"
+            "1. Проверить реквизиты\n"
+            "2. Показать юристу\n"
+            "3. Сохранить копию"
+        )
         await state.clear()
 
         # Удаляем временные файлы
-        for file_path in [path, final_path]:
-            if file_path and os.path.exists(file_path):
-                os.unlink(file_path)
+        if os.path.exists(final_path):
+            os.unlink(final_path)
+        
+        temp_path = data.get('document_path', '')
+        if temp_path and os.path.exists(temp_path):
+            os.unlink(temp_path)
 
     async def auto_review_and_fix(self, document: str, chat_id: int) -> str:
         try:
             async with self.show_loading(chat_id, ChatAction.TYPING):
+                # Усиленный промпт для исправления документа
                 reviewed = await self.generate_gpt_response(
-                    system_prompt="""Ты юридический редактор. Проверь документ на:
+                    system_prompt="""Ты юридический редактор. Проверь документ и ВНЕСИ ИСПРАВЛЕНИЯ НАПРЯМУЮ В ТЕКСТ:
                     1. Противоречивые условия
                     2. Юридические неточности
-                    3. Опечатки и грамматические ошибки
-                    4. Конфликт интересов (один человек представляет обе стороны)
-                    5. Незаполненные обязательные реквизиты
-                    Верни исправленный документ в исходном формате.""",
-                    user_prompt=f"Проверь документ:\n\n{document}",
+                    3. Опечатки и грамматику
+                    4. Конфликт интересов (один человек в обеих ролях)
+                    5. Незаполненные реквизиты
+                    
+                    КРИТИЧЕСКИ ВАЖНО:
+                    - Возвращай ТОЛЬКО готовый исправленный документ
+                    - НИКАКИХ комментариев, пояснений или заметок
+                    - Сохрани исходную структуру и форматирование
+                    - Если проблема требует решения пользователя - оставь как есть""",
+                    user_prompt=f"Исправь этот документ:\n\n{document}",
                     chat_id=chat_id
                 )
             
-            return reviewed
+            # Фильтрация ответа (оставляем только документ)
+            if "```" in reviewed:
+                reviewed = reviewed.split("```")[1]
+            return reviewed.strip()
+        
         except Exception as e:
             logger.error("Ошибка проверки: %s", e)
             return document
