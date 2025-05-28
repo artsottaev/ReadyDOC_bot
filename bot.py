@@ -131,18 +131,64 @@ class BotApplication:
             'names': names
         }
 
-    def is_requisite(self, entity: str, context: str) -> bool:
-        context_lower = context.lower()
+    async def identify_roles(self, document_text: str) -> dict:
+        """Используем ИИ для определения ролей участников договора"""
+        try:
+            response = await self.generate_gpt_response(
+                system_prompt="""Ты юридический ассистент. Определи роли участников договора и их реквизиты.
+                Ответь в формате JSON:
+                {
+                    "roles": {
+                        "Роль1": ["ТИП_ДАННЫХ_1", "ТИП_ДАННЫХ_2", ...],
+                        "Роль2": ["ТИП_ДАННЫХ_1", ...]
+                    }
+                }
+                Пример: 
+                {
+                    "roles": {
+                        "Арендодатель": ["НАЗВАНИЕ_ОРГАНИЗАЦИИ", "ИНН", "АДРЕС"],
+                        "Арендатор": ["ФИО", "ПАСПОРТ"]
+                    }
+                }""",
+                user_prompt=f"Документ:\n{document_text}"
+            )
+            
+            # Извлекаем JSON из ответа
+            json_match = re.search(r'\{.*\}', response, re.DOTALL)
+            if json_match:
+                import json
+                return json.loads(json_match.group(0))
+            return {"roles": {}}
+        except Exception as e:
+            logger.error("Ошибка определения ролей: %s", e)
+            return {"roles": {}}
+
+    async def map_variable_to_question(self, var_name: str, context: str, role_info: dict) -> str:
+        """Улучшенное формирование вопросов с использованием ИИ"""
+        # Сначала попробуем определить роль по контексту
+        role = None
+        for role_name, fields in role_info.get("roles", {}).items():
+            if var_name in fields:
+                role = role_name
+                break
         
-        # Для организаций
-        if any(kw in context_lower for kw in ['арендодатель', 'арендатор', 'сторона', 'организация']):
-            return True
-            
-        # Для имен
-        if any(kw in context_lower for kw in ['директор', 'представитель', 'лицо', 'подпись', 'фио']):
-            return True
-            
-        return False
+        # Основные шаблоны
+        if "название_организации" in var_name.lower():
+            return f"Введите полное юридическое название организации {f'для {role}' if role else ''}"
+        elif "фио" in var_name.lower():
+            return f"Введите ФИО {f'для {role}' if role else ''} (полностью, в формате 'Иванов Иван Иванович')"
+        elif "телефон" in var_name.lower():
+            return f"Введите телефон {f'для {role}' if role else ''} в формате +7XXXXXXXXXX"
+        elif "адрес" in var_name.lower():
+            return f"Введите юридический адрес {f'для {role}' if role else ''} (с индексом)"
+        elif "инн" in var_name.lower():
+            return f"Введите ИНН {f'для {role}' if role else ''} (10 или 12 цифр)"
+        elif "дата" in var_name.lower():
+            return f"Введите дату {f'для {role}' if role else ''} в формате ДД.ММ.ГГГГ"
+        
+        # Общий случай
+        name = var_name.replace("_", " ").lower()
+        return f"Введите {name}{f' для {role}' if role else ''}"
 
     async def validate_inn(self, inn: str):
         async with httpx.AsyncClient() as client:
@@ -172,32 +218,6 @@ class BotApplication:
             stop_event.set()
             await loader_task
             self.current_chat_id = None
-
-    def map_variable_to_question(self, var_name: str, context: str) -> str:
-        """Преобразует техническое имя переменной в человекочитаемый вопрос"""
-        var_lower = var_name.lower()
-        
-        # Основные шаблоны
-        if "название_организации" in var_lower:
-            return "Введите полное юридическое название организации"
-        elif "фио" in var_lower:
-            return "Введите ФИО (полностью, в формате 'Иванов Иван Иванович')"
-        elif "телефон" in var_lower:
-            return "Введите телефон в формате +7XXXXXXXXXX"
-        elif "адрес" in var_lower:
-            return "Введите юридический адрес (с индексом)"
-        elif "инн" in var_lower:
-            return "Введите ИНН организации (10 или 12 цифр)"
-        elif "дата" in var_lower:
-            return "Введите дату в формате ДД.ММ.ГГГГ"
-        
-        # Автоматическое определение роли
-        role_match = re.search(r"арендодатель|арендатор|покупатель|продавец|заказчик|исполнитель", context.lower())
-        role = f" ({role_match.group(0)})" if role_match else ""
-        
-        # Общий случай
-        name = var_name.replace("_", " ").lower()
-        return f"Введите {name}{role}"
 
     def register_handlers(self):
         @self.dp.message(F.text == "/start")
@@ -230,7 +250,8 @@ class BotApplication:
                         Обязательно явно указывай:
                         - Названия организаций в формате [НАЗВАНИЕ_ОРГАНИЗАЦИИ_1]
                         - ФИО ответственных лиц: [ФИО_1]
-                        - Контактные данные: [ТЕЛЕФОН_1], [АДРЕС_1]""",
+                        - Контактные данные: [ТЕЛЕФОН_1], [АДРЕС_1]
+                        - Другие реквизиты: [ИНН_1], [ПАСПОРТ_1]""",
                         user_prompt=f"Составь документ по описанию:\n\n{message.text}"
                     )
 
@@ -292,7 +313,8 @@ class BotApplication:
             suggestions = {
                 "дата": datetime.datetime.now().strftime("%d.%m.%Y"),
                 "телефон": "+79990001122",
-                "инн": "1234567890" if "организации" in current_var.lower() else "123456789012"
+                "инн": "1234567890" if "организации" in current_var.lower() else "123456789012",
+                "паспорт": "4510 123456 выдан ОВД г. Москвы 01.01.2020"
             }
             
             # Ищем подходящий вариант
@@ -322,19 +344,23 @@ class BotApplication:
 
             if current_var.startswith('ИНН'):
                 if not (value.isdigit() and len(value) in (10, 12)):
-                    error = "❌ Неверный формат ИНН"
+                    error = "❌ Неверный формат ИНН (должно быть 10 или 12 цифр)"
                 elif not await self.validate_inn(value):
-                    error = "❌ Недействительный ИНН"
+                    error = "❌ Недействительный ИНН (проверка не прошла)"
             
             elif current_var.startswith('ТЕЛЕФОН'):
                 if not re.match(r'^\+7\d{10}$', value):
-                    error = "❌ Формат: +7XXXXXXXXXX"
+                    error = "❌ Неверный формат телефона. Пример: +79998887766"
             
             elif current_var.startswith('ДАТА'):
                 try:
                     datetime.datetime.strptime(value, '%d.%m.%Y')
                 except ValueError:
-                    error = "❌ Формат даты: ДД.ММ.ГГГГ"
+                    error = "❌ Неверный формат даты. Используйте ДД.ММ.ГГГГ"
+            
+            elif current_var.startswith('ПАСПОРТ'):
+                if not re.match(r'^\d{4} \d{6}$', value):
+                    error = "❌ Неверный формат паспорта. Пример: 4510 123456"
             
             if error:
                 await message.answer(error)
@@ -352,35 +378,56 @@ class BotApplication:
         data = await state.get_data()
         document_text = data['document_text']
         
-        explicit_vars = list(set(re.findall(r'\[(.*?)\]', document_text)))
-        entities = self.extract_entities(document_text)
+        # Используем ИИ для определения ролей и реквизитов
+        role_info = await self.identify_roles(document_text)
+        logger.info("Определенные роли: %s", role_info)
         
-        # Логирование найденных сущностей для отладки
-        logger.info("Найденные организации: %s", entities['organisations'])
-        logger.info("Найденные имена: %s", entities['names'])
+        # Извлекаем все уникальные переменные
+        all_vars = list(set(re.findall(r'\[(.*?)\]', document_text)))
         
-        implicit_vars = []
-        for i, org in enumerate(entities['organisations'], 1):
-            if self.is_requisite(org, document_text):
-                implicit_vars.append(f"НАЗВАНИЕ_ОРГАНИЗАЦИИ_{i}")
+        # Группируем переменные по ролям
+        grouped_vars = {}
+        for var in all_vars:
+            # Определяем к какой роли относится переменная
+            role = "Общие"
+            for role_name, fields in role_info.get("roles", {}).items():
+                if var in fields:
+                    role = role_name
+                    break
+                    
+            if role not in grouped_vars:
+                grouped_vars[role] = []
+            grouped_vars[role].append(var)
         
-        for i, name in enumerate(entities['names'], 1):
-            if self.is_requisite(name, document_text):
-                implicit_vars.append(f"ФИО_{i}")
+        # Создаем плоский список с сохранением порядка групп
+        ordered_vars = []
+        var_descriptions = {}
         
-        all_vars = list(set(explicit_vars + implicit_vars))
+        # Сначала общие реквизиты
+        if "Общие" in grouped_vars:
+            for var in grouped_vars["Общие"]:
+                ordered_vars.append(var)
+                var_descriptions[var] = await self.map_variable_to_question(var, document_text, role_info)
+        
+        # Затем специфичные для ролей
+        for role, vars_list in grouped_vars.items():
+            if role == "Общие":
+                continue
+                
+            # Добавляем разделитель
+            ordered_vars.append(f"---{role}---")
+            var_descriptions[f"---{role}---"] = f"🔹 {role}"
+            
+            for var in vars_list:
+                ordered_vars.append(var)
+                var_descriptions[var] = await self.map_variable_to_question(var, document_text, role_info)
         
         # Логирование всех переменных
-        logger.info("Все переменные для заполнения: %s", all_vars)
-        
-        # Создаем человекочитаемые описания
-        var_descriptions = {}
-        for var in all_vars:
-            var_descriptions[var] = self.map_variable_to_question(var, document_text)
+        logger.info("Упорядоченные переменные: %s", ordered_vars)
         
         await state.update_data(
-            variables=all_vars,
-            var_descriptions=var_descriptions,  # Сохраняем описания
+            variables=ordered_vars,
+            var_descriptions=var_descriptions,
             filled_variables={},
             current_variable_index=0
         )
@@ -397,6 +444,14 @@ class BotApplication:
             return
             
         current_var = variables[index]
+        
+        # Если это разделитель группы
+        if current_var.startswith("---"):
+            await message.answer(f"<b>{var_descriptions[current_var]}</b>")
+            await state.update_data(current_variable_index=index + 1)
+            await self.ask_next_variable(message, state)
+            return
+            
         description = var_descriptions[current_var]
         
         # Формируем клавиатуру с подсказками
@@ -425,40 +480,32 @@ class BotApplication:
         document_text = data['document_text']
         filled_vars = data['filled_variables']
         
-        # Замена явных переменных
+        # Замена переменных
         for var in data['variables']:
-            document_text = re.sub(
-                rf'\[{re.escape(var)}\]', 
-                filled_vars.get(var, f"[{var}]"), 
-                document_text
-            )
-        
-        # Замена сущностей
-        entities = self.extract_entities(document_text)
-        for i, org in enumerate(entities['organisations'], 1):
-            var_name = f"НАЗВАНИЕ_ОРГАНИЗАЦИИ_{i}"
-            if var_name in filled_vars:
-                document_text = document_text.replace(
-                    org, 
-                    filled_vars[var_name]
-                )
-        
-        for i, name in enumerate(entities['names'], 1):
-            var_name = f"ФИО_{i}"
-            if var_name in filled_vars:
-                document_text = document_text.replace(
-                    name, 
-                    filled_vars[var_name]
+            if var.startswith("---"):
+                continue
+                
+            if var in filled_vars:
+                document_text = re.sub(
+                    rf'\[{re.escape(var)}\]', 
+                    filled_vars[var], 
+                    document_text
                 )
         
         async with self.show_loading(message.chat.id, ChatAction.UPLOAD_DOCUMENT):
+            # Автоматическая проверка и фикс
             reviewed_doc = await self.auto_review_and_fix(document_text)
+            
+            # Проверка заполненности
+            missing_vars = set(re.findall(r'\[(.*?)\]', reviewed_doc))
+            if missing_vars:
+                await message.answer("⚠️ Остались незаполненные поля. Дополнительно проверьте документ.")
         
         filename = f"final_{message.from_user.id}.docx"
         path = self.save_docx(reviewed_doc, filename)
         
         await message.answer_document(FSInputFile(path))
-        await message.answer("✅ Документ готов!")
+        await message.answer("✅ Документ готов! Проверьте его перед использованием.")
         await state.clear()
 
         if os.path.exists(path):
@@ -468,8 +515,12 @@ class BotApplication:
         try:
             async with self.show_loading(self.current_chat_id, ChatAction.TYPING):
                 reviewed = await self.generate_gpt_response(
-                    system_prompt="Исправь ошибки и незаполненные поля в документе",
-                    user_prompt=f"Документ для проверки:\n\n{document}"
+                    system_prompt="""Ты юридический редактор. Проверь документ на:
+                    1. Незаполненные поля в квадратных скобках
+                    2. Противоречивые условия
+                    3. Юридические неточности
+                    Если все в порядке, верни тот же текст""",
+                    user_prompt=f"Проверь документ:\n\n{document}"
                 )
             
             if reviewed != document:
@@ -490,13 +541,14 @@ class BotApplication:
         try:
             async with self.show_loading(self.current_chat_id, ChatAction.TYPING):
                 response = await self.openai_client.chat.completions.create(
-                    model="gpt-3.5-turbo-0125",
+                    model="gpt-4-turbo",
                     messages=[
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_prompt}
                     ],
-                    temperature=0.3,
-                    max_tokens=3000
+                    temperature=0.2,
+                    max_tokens=4000,
+                    response_format={"type": "text"}
                 )
             return response.choices[0].message.content.strip()
         except Exception as e:
