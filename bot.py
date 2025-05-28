@@ -105,6 +105,7 @@ class BotApplication:
             waiting_for_initial_input = State()
             waiting_for_special_terms = State()
             current_variable = State()
+            document_review = State()
         
         self.states = DocGenState
         self.register_handlers()
@@ -138,8 +139,14 @@ class BotApplication:
                 Ответь в формате JSON:
                 {
                     "roles": {
-                        "Роль1": ["ТИП_ДАННЫХ_1", "ТИП_ДАННЫХ_2", ...],
-                        "Роль2": ["ТИП_ДАННЫХ_1", ...]
+                        "Роль1": {
+                            "fields": ["ТИП_ДАННЫХ_1", "ТИП_ДАННЫХ_2"],
+                            "description": "Описание роли"
+                        },
+                        "Роль2": {
+                            "fields": ["ТИП_ДАННЫХ_3"],
+                            "description": "Описание роли"
+                        }
                     },
                     "field_descriptions": {
                         "ТИП_ДАННЫХ_1": "Человекочитаемое описание"
@@ -148,12 +155,18 @@ class BotApplication:
                 Пример: 
                 {
                     "roles": {
-                        "Арендодатель": ["НАЗВАНИЕ_ОРГАНИЗАЦИИ", "ИНН", "АДРЕС"],
-                        "Арендатор": ["ФИО", "ПАСПОРТ"]
+                        "Арендодатель": {
+                            "fields": ["НАЗВАНИЕ_ОРГАНИЗАЦИИ", "ИНН", "АДРЕС"],
+                            "description": "Собственник недвижимости"
+                        },
+                        "Арендатор": {
+                            "fields": ["ФИО", "ПАСПОРТ"],
+                            "description": "Арендатор помещения"
+                        }
                     },
                     "field_descriptions": {
-                        "АДРЕС": "юридический адрес",
-                        "СУММА": "размер арендной платы"
+                        "НАЗВАНИЕ_ОРГАНИЗАЦИИ": "официальное наименование компании",
+                        "ФИО": "полное имя генерального директора"
                     }
                 }""",
                 user_prompt=f"Документ:\n{document_text}",
@@ -171,51 +184,22 @@ class BotApplication:
 
     def map_variable_to_question(self, var_name: str, role_info: dict) -> str:
         """Улучшенное формирование вопросов с использованием ИИ"""
-        # Сначала попробуем определить роль по контексту
+        # Ищем к какой роли относится поле
         role = None
-        for role_name, fields in role_info.get("roles", {}).items():
-            if var_name in fields:
+        role_description = ""
+        for role_name, role_data in role_info.get("roles", {}).items():
+            if var_name in role_data.get("fields", []):
                 role = role_name
+                role_description = role_data.get("description", "")
                 break
         
         # Пробуем получить описание из field_descriptions
-        description = role_info.get("field_descriptions", {}).get(var_name, None)
+        description = role_info.get("field_descriptions", {}).get(var_name, var_name.replace("_", " ").lower())
         
-        # Если есть кастомное описание - используем его
-        if description:
-            if role:
-                return f"Введите {description} для {role}"
-            return f"Введите {description}"
-        
-        # Основные шаблоны
-        var_lower = var_name.lower()
-        
-        if "название" in var_lower or "организации" in var_lower:
-            return f"Введите полное юридическое название {f'{role}' if role else 'организации'}"
-        elif "фио" in var_lower:
-            return f"Введите ФИО {f'{role}' if role else ''} (полностью, в формате 'Иванов Иван Иванович')"
-        elif "телефон" in var_lower:
-            return f"Введите телефон {f'{role}' if role else ''} в формате +7XXXXXXXXXX"
-        elif "адрес" in var_lower:
-            return f"Введите юридический адрес {f'{role}' if role else ''} (с индексом)"
-        elif "инн" in var_lower:
-            return f"Введите ИНН {f'{role}' if role else ''} (10 или 12 цифр)"
-        elif "дата" in var_lower:
-            return f"Введите дату {f'{role}' if role else ''} в формате ДД.ММ.ГГГГ"
-        elif "паспорт" in var_lower:
-            return f"Введите паспортные данные {f'{role}' if role else ''} (серия и номер)"
-        elif "сумма" in var_lower:
-            return f"Введите сумму {f'{role}' if role else ''} в рублях (например: 10000 или 15 000)"
-        elif "срок" in var_lower:
-            return f"Введите срок {f'{role}' if role else ''} (например: 1 год или 6 месяцев)"
-        elif "процент" in var_lower:
-            return f"Введите процентную ставку {f'{role}' if role else ''} (например: 5% или 10 процентов)"
-        
-        # Общий случай
-        name = var_name.replace("_", " ").lower()
+        # Формируем понятный вопрос
         if role:
-            return f"Введите {name} для {role}"
-        return f"Введите {name}"
+            return f"Введите <b>{description}</b> для <b>{role}</b> ({role_description})"
+        return f"Введите <b>{description}</b>"
 
     def validate_inn(self, inn: str) -> bool:
         """Упрощенная проверка ИНН (только формат)"""
@@ -281,7 +265,9 @@ class BotApplication:
                         - ФИО ответственных лиц: [ФИО]
                         - Контактные данные: [ТЕЛЕФОН], [АДРЕС]
                         - Другие реквизиты: [ИНН], [ПАСПОРТ]
-                        - Суммы и сроки: [СУММА], [СРОК]""",
+                        - Суммы и сроки: [СУММА], [СРОК]
+                        Для каждой стороны договора явно указывай её роль в скобках:
+                        Пример: [НАЗВАНИЕ_ОРГАНИЗАЦИИ (Арендодатель)]""",
                         user_prompt=f"Составь документ по описанию:\n\n{message.text}",
                         chat_id=message.chat.id
                     )
@@ -410,6 +396,17 @@ class BotApplication:
             )
             await self.ask_next_variable(message, state)
 
+        @self.dp.callback_query(F.data == "confirm_document")
+        async def handle_confirm_document(callback: types.CallbackQuery, state: FSMContext):
+            await callback.message.delete()
+            await self.send_final_document(callback.message, state)
+
+        @self.dp.callback_query(F.data == "edit_document")
+        async def handle_edit_document(callback: types.CallbackQuery, state: FSMContext):
+            await callback.message.delete()
+            await state.set_state(self.states.waiting_for_special_terms)
+            await callback.message.answer("✏️ Введите дополнительные правки или 'нет' для завершения:")
+
     async def start_variable_filling(self, message: Message, state: FSMContext):
         data = await state.get_data()
         document_text = data['document_text']
@@ -426,8 +423,8 @@ class BotApplication:
         for var in all_vars:
             # Определяем к какой роли относится переменная
             role = "Общие"
-            for role_name, fields in role_info.get("roles", {}).items():
-                if var in fields:
+            for role_name, role_data in role_info.get("roles", {}).items():
+                if var in role_data.get("fields", []):
                     role = role_name
                     break
                     
@@ -451,8 +448,10 @@ class BotApplication:
                 continue
                 
             # Добавляем разделитель
+            role_data = role_info["roles"].get(role, {})
+            role_desc = role_data.get("description", role)
             ordered_vars.append(f"---{role}---")
-            var_descriptions[f"---{role}---"] = f"🔹 {role}"
+            var_descriptions[f"---{role}---"] = f"🔹 <b>{role}</b> ({role_desc})"
             
             for var in vars_list:
                 ordered_vars.append(var)
@@ -476,14 +475,14 @@ class BotApplication:
         index = data['current_variable_index']
         
         if index >= len(variables):
-            await self.finalize_document(message, state)
+            await self.prepare_final_document(message, state)
             return
             
         current_var = variables[index]
         
         # Если это разделитель группы
         if current_var.startswith("---"):
-            await message.answer(f"<b>{var_descriptions[current_var]}</b>")
+            await message.answer(var_descriptions[current_var])
             await state.update_data(current_variable_index=index + 1)
             await self.ask_next_variable(message, state)
             return
@@ -511,7 +510,7 @@ class BotApplication:
             reply_markup=keyboard
         )
 
-    async def finalize_document(self, message: Message, state: FSMContext):
+    async def prepare_final_document(self, message: Message, state: FSMContext):
         data = await state.get_data()
         document_text = data['document_text']
         filled_vars = data['filled_variables']
@@ -532,42 +531,70 @@ class BotApplication:
             # Автоматическая проверка и фикс
             reviewed_doc = await self.auto_review_and_fix(document_text, message.chat.id)
             
+            # Сохраняем результат для финального подтверждения
+            filename = f"prefinal_{message.from_user.id}.docx"
+            path = self.save_docx(reviewed_doc, filename)
+            
+            await state.update_data(
+                final_document=reviewed_doc,
+                document_path=path
+            )
+            
             # Проверка заполненности
             missing_vars = set(re.findall(r'\[(.*?)\]', reviewed_doc))
             if missing_vars:
-                await message.answer(f"⚠️ Остались незаполненные поля: {', '.join(missing_vars)}")
+                await message.answer(
+                    f"⚠️ В документе остались незаполненные поля: {', '.join(missing_vars)}\n"
+                    "Пожалуйста, проверьте документ перед отправкой."
+                )
+            
+            # Отправляем документ на подтверждение
+            await message.answer_document(FSInputFile(path))
+            
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="✅ Подтвердить", callback_data="confirm_document"),
+                    InlineKeyboardButton(text="✏️ Редактировать", callback_data="edit_document")
+                ]
+            ])
+            
+            await message.answer(
+                "📝 Документ готов к отправке. Пожалуйста, проверьте его и подтвердите или отправьте на редактирование.",
+                reply_markup=keyboard
+            )
+            await state.set_state(self.states.document_review)
+
+    async def send_final_document(self, message: Message, state: FSMContext):
+        data = await state.get_data()
+        document_text = data['final_document']
+        path = data['document_path']
         
+        # Сохраняем финальную версию
         filename = f"final_{message.from_user.id}.docx"
-        path = self.save_docx(reviewed_doc, filename)
+        final_path = self.save_docx(document_text, filename)
         
-        await message.answer_document(FSInputFile(path))
+        await message.answer_document(FSInputFile(final_path))
         await message.answer("✅ Документ готов! Проверьте его перед использованием.")
         await state.clear()
 
-        if os.path.exists(path):
-            os.unlink(path)
+        # Удаляем временные файлы
+        for file_path in [path, final_path]:
+            if os.path.exists(file_path):
+                os.unlink(file_path)
 
     async def auto_review_and_fix(self, document: str, chat_id: int) -> str:
         try:
             async with self.show_loading(chat_id, ChatAction.TYPING):
                 reviewed = await self.generate_gpt_response(
                     system_prompt="""Ты юридический редактор. Проверь документ на:
-                    1. Незаполненные поля в квадратных скобках
-                    2. Противоречивые условия
-                    3. Юридические неточности
-                    Если все в порядке, верни тот же текст""",
+                    1. Противоречивые условия
+                    2. Юридические неточности
+                    3. Опечатки и грамматические ошибки
+                    Исправь только найденные ошибки, не меняй структуру и не заполняй пропуски.
+                    Верни исправленный документ в исходном формате.""",
                     user_prompt=f"Проверь документ:\n\n{document}",
                     chat_id=chat_id
                 )
-            
-            if reviewed != document:
-                diff = difflib.unified_diff(
-                    document.splitlines(), 
-                    reviewed.splitlines(),
-                    fromfile='original',
-                    tofile='modified'
-                )
-                logger.info("Изменения:\n%s", '\n'.join(diff))
             
             return reviewed
         except Exception as e:
