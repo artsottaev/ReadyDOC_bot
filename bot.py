@@ -188,7 +188,7 @@ class BotApplication:
         
         # Формируем понятный вопрос
         if role:
-            return f"✍️ Введите <b>{description}</b> для <b>{role}</b>:"
+            return f"✍️ Введите <b>{description}</b> для роли <b>{role}</b>:"
         return f"✍️ Введите <b>{description}</b>:"
 
     def validate_inn(self, inn: str) -> bool:
@@ -331,40 +331,85 @@ class BotApplication:
             
             value = message.text
             error = None
+            detailed_error = ""
+
+            # Определяем роль для текущей переменной
+            current_role = "документа"
+            role_info = data.get('role_info', {})
+            for role_name, role_data in role_info.get("roles", {}).items():
+                if current_var in role_data.get("fields", []):
+                    current_role = role_name
+                    break
 
             if "инн" in current_var.lower():
                 if not self.validate_inn(value):
-                    error = "❌ Неверный формат ИНН (должно быть 10 или 12 цифр)"
+                    detailed_error = (
+                        "❌ Неверный формат ИНН\n"
+                        f"Этот ИНН нужен для: <b>{current_role}</b>\n\n"
+                        "Формат:\n"
+                        "- 10 цифр для организаций\n"
+                        "- 12 цифр для ИП/физлиц\n"
+                        "Пример: <code>1234567890</code> или <code>123456789012</code>"
+                    )
             
             elif "телефон" in current_var.lower():
                 if not re.match(r'^\+7\d{10}$', value):
-                    error = "❌ Неверный формат телефона. Пример: +79998887766"
+                    detailed_error = (
+                        "❌ Неверный формат телефона\n"
+                        f"Этот телефон нужен для: <b>{current_role}</b>\n\n"
+                        "Формат: +7 и 10 цифр без пробелов\n"
+                        "Пример: <code>+79998887766</code>"
+                    )
             
             elif "дата" in current_var.lower():
                 try:
                     datetime.datetime.strptime(value, '%d.%m.%Y')
                 except ValueError:
-                    error = "❌ Неверный формат даты. Используйте ДД.ММ.ГГГГ"
+                    detailed_error = (
+                        "❌ Неверный формат даты\n"
+                        f"Эта дата нужна для: <b>{current_role}</b>\n\n"
+                        "Используйте формат: ДД.ММ.ГГГГ\n"
+                        "Пример: <code>01.01.2023</code>"
+                    )
             
             elif "паспорт" in current_var.lower():
                 if not re.match(r'^\d{4} \d{6}$', value):
-                    error = "❌ Неверный формат паспорта. Пример: 4510 123456"
+                    detailed_error = (
+                        "❌ Неверный формат паспорта\n"
+                        f"Эти данные нужны для: <b>{current_role}</b>\n\n"
+                        "Формат: серия (4 цифры) и номер (6 цифр) через пробел\n"
+                        "Пример: <code>4510 123456</code>"
+                    )
             
             elif "сумма" in current_var.lower():
                 if not re.match(r'^[\d\s]+$', value):
-                    error = "❌ Неверный формат суммы. Используйте цифры (например: 10000 или 15 000)"
+                    detailed_error = (
+                        "❌ Неверный формат суммы\n"
+                        f"Эта сумма нужна для: <b>{current_role}</b>\n\n"
+                        "Используйте цифры (можно с пробелами)\n"
+                        "Примеры: <code>10000</code> или <code>15 000</code>"
+                    )
             
             elif "огрн" in current_var.lower():
                 if not re.match(r'^\d{13}$', value):
-                    error = "❌ Неверный формат ОГРН (должно быть 13 цифр)"
+                    detailed_error = (
+                        "❌ Неверный формат ОГРН\n"
+                        f"Этот ОГРН нужен для: <b>{current_role}</b>\n\n"
+                        "Должно быть ровно 13 цифр\n"
+                        "Пример: <code>1234567890123</code>"
+                    )
             
-            # Новая валидация для названия организации
             elif "название_организации" in current_var.lower():
                 if not re.match(r'^[\w\s"-]{5,}$', value, re.IGNORECASE | re.UNICODE):
-                    error = "❌ Название организации должно содержать минимум 5 символов"
+                    detailed_error = (
+                        "❌ Название организации слишком короткое\n"
+                        f"Это название нужно для: <b>{current_role}</b>\n\n"
+                        "Должно содержать минимум 5 символов\n"
+                        "Пример: <code>ООО 'Ромашка'</code>"
+                    )
             
-            if error:
-                await message.answer(error)
+            if detailed_error:
+                await message.answer(detailed_error)
                 return
 
             filled = data['filled_variables']
@@ -482,7 +527,8 @@ class BotApplication:
             variables=ordered_vars,
             var_descriptions=var_descriptions,
             filled_variables={},
-            current_variable_index=0
+            current_variable_index=0,
+            role_info=role_info  # Сохраняем информацию о ролях
         )
         await self.ask_next_variable(message, state)
 
