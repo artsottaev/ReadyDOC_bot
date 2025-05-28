@@ -25,10 +25,12 @@ from dotenv import load_dotenv
 from docx import Document
 from redis.asyncio import Redis
 from natasha import (
-    NamesExtractor,
-    OrgExtractor,  # Изменено с OrganisationExtractor
-    MorphVocab,
-    Doc
+    Doc,
+    Segmenter,
+    NewsEmbedding,
+    NewsMorphTagger,
+    NewsSyntaxParser,
+    NewsNERTagger
 )
 
 # Настройка логирования
@@ -49,7 +51,13 @@ class BotApplication:
         self.openai_client = None
         self.states = None
         self.current_chat_id = None
-        self.morph_vocab = MorphVocab()
+        
+        # Инициализация компонентов Natasha
+        self.segmenter = Segmenter()
+        self.emb = NewsEmbedding()
+        self.morph_tagger = NewsMorphTagger(self.emb)
+        self.syntax_parser = NewsSyntaxParser(self.emb)
+        self.ner_tagger = NewsNERTagger(self.emb)
 
     async def initialize(self):
         os.environ.pop("HTTP_PROXY", None)
@@ -104,26 +112,37 @@ class BotApplication:
 
     def extract_entities(self, text: str) -> dict:
         doc = Doc(text)
-        doc.segment(self.morph_vocab)
+        doc.segment(self.segmenter)
+        doc.tag_morph(self.morph_tagger)
+        doc.parse_syntax(self.syntax_parser)
+        doc.tag_ner(self.ner_tagger)
         
-        # Исправленный вызов OrgExtractor
-        org_extractor = OrgExtractor(self.morph_vocab)
-        name_extractor = NamesExtractor(self.morph_vocab)
+        organisations = []
+        names = []
         
-        doc.orgs = org_extractor(doc)
-        doc.names = name_extractor(doc)
+        for span in doc.spans:
+            if span.type == "ORG":
+                organisations.append(span.text)
+            elif span.type == "PER":
+                names.append(span.text)
         
         return {
-            'organisations': [org.fact.as_dict for org in doc.orgs],
-            'names': [name.fact.as_dict for name in doc.names]
+            'organisations': organisations,
+            'names': names
         }
 
-    def is_requisite(self, context: str, entity_type: str) -> bool:
-        keywords = {
-            'organisations': ['арендодатель', 'арендатор', 'сторона', 'организация'],
-            'names': ['директор', 'представитель', 'лицо', 'подпись']
-        }
-        return any(kw in context.lower() for kw in keywords[entity_type])
+    def is_requisite(self, entity: str, context: str) -> bool:
+        context_lower = context.lower()
+        
+        # Для организаций
+        if any(kw in context_lower for kw in ['арендодатель', 'арендатор', 'сторона', 'организация']):
+            return True
+            
+        # Для имен
+        if any(kw in context_lower for kw in ['директор', 'представитель', 'лицо', 'подпись', 'фио']):
+            return True
+            
+        return False
 
     async def validate_inn(self, inn: str):
         async with httpx.AsyncClient() as client:
@@ -283,18 +302,23 @@ class BotApplication:
         explicit_vars = list(set(re.findall(r'\[(.*?)\]', document_text)))
         entities = self.extract_entities(document_text)
         
+        # Логирование найденных сущностей для отладки
+        logger.info("Найденные организации: %s", entities['organisations'])
+        logger.info("Найденные имена: %s", entities['names'])
+        
         implicit_vars = []
         for i, org in enumerate(entities['organisations'], 1):
-            # Проверка контекста для организаций
-            if 'name' in org and self.is_requisite(org['name'], 'organisations'):
+            if self.is_requisite(org, document_text):
                 implicit_vars.append(f"НАЗВАНИЕ_ОРГАНИЗАЦИИ_{i}")
         
         for i, name in enumerate(entities['names'], 1):
-            # Проверка контекста для имен
-            if 'first' in name and self.is_requisite(name['first'], 'names'):
+            if self.is_requisite(name, document_text):
                 implicit_vars.append(f"ФИО_{i}")
         
         all_vars = list(set(explicit_vars + implicit_vars))
+        
+        # Логирование всех переменных
+        logger.info("Все переменные для заполнения: %s", all_vars)
         
         await state.update_data(
             variables=all_vars,
@@ -341,9 +365,17 @@ class BotApplication:
         entities = self.extract_entities(document_text)
         for i, org in enumerate(entities['organisations'], 1):
             var_name = f"НАЗВАНИЕ_ОРГАНИЗАЦИИ_{i}"
-            if var_name in filled_vars and 'name' in org:
+            if var_name in filled_vars:
                 document_text = document_text.replace(
-                    org['name'], 
+                    org, 
+                    filled_vars[var_name]
+                )
+        
+        for i, name in enumerate(entities['names'], 1):
+            var_name = f"ФИО_{i}"
+            if var_name in filled_vars:
+                document_text = document_text.replace(
+                    name, 
                     filled_vars[var_name]
                 )
         
