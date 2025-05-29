@@ -275,7 +275,45 @@ class BotApplication:
                 await message.answer("⚠️ Ошибка обработки. Попробуйте снова.")
                 await state.clear()
 
-        # ... остальные обработчики (skip_variable, dont_know) остаются без изменений ...
+        @self.dp.callback_query(F.data == "skip_variable")
+        async def handle_skip_variable(callback: types.CallbackQuery, state: FSMContext):
+            data = await state.get_data()
+            index = data['current_variable_index'] + 1
+            await state.update_data(current_variable_index=index)
+            await callback.message.delete()
+            await self.ask_next_variable(callback.message, state)
+
+        @self.dp.callback_query(F.data == "dont_know")
+        async def handle_dont_know(callback: types.CallbackQuery, state: FSMContext):
+            data = await state.get_data()
+            current_var = data['variables'][data['current_variable_index']]
+            
+            # Предлагаем варианты для пропущенных значений
+            suggestions = {
+                "дата": datetime.datetime.now().strftime("%d.%m.%Y"),
+                "телефон": "+79990001122",
+                "инн": "1234567890" if "организации" in current_var.lower() else "123456789012",
+                "паспорт": "4510 123456",
+                "сумма": "10 000",
+                "срок": "1 год",
+                "адрес": "г. Москва, ул. Ленина, д. 1",
+                "огрн": "1234567890123"
+            }
+            
+            # Ищем подходящий вариант
+            for pattern, value in suggestions.items():
+                if pattern in current_var.lower():
+                    await callback.message.answer(
+                        f"⚠️ Вы можете использовать временное значение:\n"
+                        f"<code>{value}</code>\n\n"
+                        f"Позже его нужно будет заменить на актуальное!"
+                    )
+                    return
+            
+            await callback.message.answer(
+                "⚠️ Это обязательное поле. Если информация неизвестна, "
+                "введите <code>НЕТ ДАННЫХ</code> и уточните позже"
+            )
 
         @self.dp.message(self.states.current_variable)
         async def handle_variable_input(message: Message, state: FSMContext):
@@ -382,7 +420,57 @@ class BotApplication:
             )
             await self.ask_next_variable(message, state)
 
-        # ... остальные обработчики (confirm_document, edit_document и т.д.) ...
+        @self.dp.callback_query(F.data == "confirm_document")
+        async def handle_confirm_document(callback: types.CallbackQuery, state: FSMContext):
+            await callback.message.delete()
+            await self.send_final_document(callback.message, state)
+
+        @self.dp.callback_query(F.data == "edit_document")
+        async def handle_edit_document(callback: types.CallbackQuery, state: FSMContext):
+            await callback.message.delete()
+            await state.set_state(self.states.waiting_for_initial_input)
+            await callback.message.answer("🔄 Введите новый запрос для генерации документа:")
+
+        @self.dp.callback_query(F.data == "add_terms")
+        async def handle_add_terms(callback: types.CallbackQuery, state: FSMContext):
+            await callback.message.answer(
+                "✍️ Хотите добавить особые условия? Напишите их или 'нет':"
+            )
+            await state.set_state(self.states.waiting_for_special_terms)
+
+        @self.dp.message(self.states.waiting_for_special_terms)
+        async def handle_final_additions(message: Message, state: FSMContext):
+            try:
+                data = await state.get_data()
+                
+                if message.text.strip().lower() == "нет":
+                    await self.send_final_document(message, state)
+                    return
+                
+                base_text = data.get("final_document", "")
+                
+                async with self.show_loading(message.chat.id, ChatAction.TYPING):
+                    await message.answer("🔧 Вношу изменения в документ...")
+                    updated_doc = await self.generate_gpt_response(
+                        system_prompt="Ты юридический редактор. Внеси правки, добавив особые условия. Сохрани структуру документа.",
+                        user_prompt=f"Добавь условия в документ:\n{message.text}\n\nДокумент:\n{base_text}",
+                        chat_id=message.chat.id
+                    )
+
+                filename = f"final_{message.from_user.id}.docx"
+                path = self.save_docx(updated_doc, filename)
+                
+                await message.answer_document(FSInputFile(path))
+                await message.answer("✅ Документ обновлен!")
+                await state.clear()
+                
+                if os.path.exists(path):
+                    os.unlink(path)
+                    
+            except Exception as e:
+                logger.error("Ошибка обработки: %s\n%s", e, traceback.format_exc())
+                await message.answer("⚠️ Ошибка обработки. Попробуйте снова.")
+                await state.clear()
 
     async def start_variable_filling(self, message: Message, state: FSMContext):
         data = await state.get_data()
@@ -400,7 +488,95 @@ class BotApplication:
                 if "Арендодатель" in role_info.get("roles", {}):
                     role_info["roles"]["Арендодатель"]["fields"].append(var)
         
-        # ... остальная логика группировки переменных ...
+        # Группируем переменные по ролям
+        grouped_vars = {}
+        for var in all_vars:
+            role = "Общие"
+            for role_name, role_data in role_info.get("roles", {}).items():
+                if var in role_data.get("fields", []):
+                    role = role_name
+                    break
+                    
+            if role not in grouped_vars:
+                grouped_vars[role] = []
+            grouped_vars[role].append(var)
+        
+        # Создаем плоский список с сохранением порядка групп
+        ordered_vars = []
+        var_descriptions = {}
+        
+        # Сначала общие реквизиты
+        if "Общие" in grouped_vars:
+            for var in grouped_vars["Общие"]:
+                ordered_vars.append(var)
+                var_descriptions[var] = self.map_variable_to_question(var, role_info)
+        
+        # Затем специфичные для ролей
+        for role, vars_list in grouped_vars.items():
+            if role == "Общие":
+                continue
+                
+            # Добавляем разделитель
+            ordered_vars.append(f"---{role}---")
+            var_descriptions[f"---{role}---"] = f"🔹 <b>{role}</b>"
+            
+            for var in vars_list:
+                ordered_vars.append(var)
+                var_descriptions[var] = self.map_variable_to_question(var, role_info)
+        
+        # Логирование всех переменных
+        logger.info("Упорядоченные переменные: %s", ordered_vars)
+        
+        await state.update_data(
+            variables=ordered_vars,
+            var_descriptions=var_descriptions,
+            filled_variables={},
+            current_variable_index=0,
+            role_info=role_info  # Сохраняем информацию о ролях
+        )
+        await self.ask_next_variable(message, state)
+
+    async def ask_next_variable(self, message: Message, state: FSMContext):
+        data = await state.get_data()
+        variables = data['variables']
+        var_descriptions = data['var_descriptions']
+        index = data['current_variable_index']
+        
+        if index >= len(variables):
+            await self.prepare_final_document(message, state)
+            return
+            
+        current_var = variables[index]
+        
+        # Если это разделитель группы
+        if current_var.startswith("---"):
+            await message.answer(var_descriptions[current_var])
+            await state.update_data(current_variable_index=index + 1)
+            await self.ask_next_variable(message, state)
+            return
+            
+        description = var_descriptions[current_var]
+        
+        # Формируем клавиатуру с подсказками
+        keyboard_buttons = []
+        
+        # Добавляем кнопку пропуска
+        keyboard_buttons.append(
+            InlineKeyboardButton(text="⏭ Пропустить", callback_data="skip_variable")
+        )
+        
+        # Добавляем кнопку "Не знаю"
+        keyboard_buttons.append(
+            InlineKeyboardButton(text="❓ Не знаю", callback_data="dont_know")
+        )
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[keyboard_buttons])
+        
+        await state.set_state(self.states.current_variable)
+        await message.answer(
+            description,
+            reply_markup=keyboard
+        )
 
     async def prepare_final_document(self, message: Message, state: FSMContext):
         data = await state.get_data()
@@ -417,8 +593,11 @@ class BotApplication:
                 
                 # Для сумм добавляем прописную форму
                 if "сумма" in var.lower() and value.replace(" ", "").isdigit():
-                    num = int(value.replace(" ", ""))
-                    value = f"{value} ({self.num2words(num)} рублей)"
+                    try:
+                        num = int(value.replace(" ", ""))
+                        value = f"{value} ({self.num2words(num)} рублей)"
+                    except:
+                        pass
                 
                 document_text = re.sub(
                     rf'\[{re.escape(var)}\]', 
@@ -445,7 +624,79 @@ class BotApplication:
                 "______________________   / [Подпись] /"
             )
         
-        # ... остальная логика ...
+        async with self.show_loading(message.chat.id, ChatAction.UPLOAD_DOCUMENT):
+            # Автоматическая проверка и фикс
+            reviewed_doc = await self.auto_review_and_fix(document_text, message.chat.id)
+            
+            # Проверка заполненности
+            missing_vars = set(re.findall(r'\[(.*?)\]', reviewed_doc))
+            if missing_vars:
+                await message.answer(
+                    f"⚠️ В документе остались незаполненные поля: {', '.join(missing_vars)}\n"
+                    "Пожалуйста, проверьте документ перед отправкой."
+                )
+            
+            # Сохраняем результат для финального подтверждения
+            filename = f"prefinal_{message.from_user.id}.docx"
+            path = self.save_docx(reviewed_doc, filename)
+            
+            await state.update_data(
+                final_document=reviewed_doc,
+                document_path=path
+            )
+            
+            # Отправляем документ на подтверждение
+            await message.answer_document(FSInputFile(path))
+            
+            # Новая клавиатура с вопросом про особые условия
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="✅ Завершить", callback_data="confirm_document"),
+                    InlineKeyboardButton(text="✏️ Добавить условия", callback_data="add_terms")
+                ],
+                [
+                    InlineKeyboardButton(text="🔄 Перегенерировать", callback_data="edit_document")
+                ]
+            ])
+            
+            await message.answer(
+                "📝 Документ готов! Вы можете:\n"
+                "- Завершить и получить финальную версию\n"
+                "- Добавить особые условия\n"
+                "- Перегенерировать документ с нуля",
+                reply_markup=keyboard
+            )
+            await state.set_state(self.states.document_review)
+
+    async def send_final_document(self, message: Message, state: FSMContext):
+        data = await state.get_data()
+        document_text = data.get('final_document', '')
+        
+        if not document_text:
+            await message.answer("⚠️ Ошибка: документ не найден")
+            await state.clear()
+            return
+        
+        # Генерируем финальный DOCX
+        filename = f"Юридический_документ_{datetime.datetime.now().strftime('%d%m%Y')}.docx"
+        final_path = self.save_docx(document_text, filename)
+        
+        await message.answer_document(FSInputFile(final_path))
+        await message.answer(
+            "✅ Документ готов! Рекомендуем:\n"
+            "1. Проверить реквизиты\n"
+            "2. Показать юристу\n"
+            "3. Сохранить копию"
+        )
+        await state.clear()
+
+        # Удаляем временные файлы
+        if os.path.exists(final_path):
+            os.unlink(final_path)
+        
+        temp_path = data.get('document_path', '')
+        if temp_path and os.path.exists(temp_path):
+            os.unlink(temp_path)
 
     async def auto_review_and_fix(self, document: str, chat_id: int) -> str:
         try:
@@ -474,7 +725,68 @@ class BotApplication:
             logger.error("Ошибка проверки: %s", e)
             return document
 
-    # ... остальные методы без изменений ...
+    async def generate_gpt_response(self, system_prompt: str, user_prompt: str, chat_id: int) -> str:
+        try:
+            if chat_id:
+                async with self.show_loading(chat_id, ChatAction.TYPING):
+                    response = await self.openai_client.chat.completions.create(
+                        model="gpt-3.5-turbo-0125",
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt}
+                        ],
+                        temperature=0.2,
+                        max_tokens=3000
+                    )
+            else:
+                response = await self.openai_client.chat.completions.create(
+                    model="gpt-3.5-turbo-0125",
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    temperature=0.2,
+                    max_tokens=3000
+                )
+                
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            logger.error("Ошибка OpenAI: %s", e)
+            return "❌ Ошибка генерации. Попробуйте позже."
+
+    def save_docx(self, text: str, filename: str) -> str:
+        try:
+            doc = Document()
+            for para in text.split("\n"):
+                if para.strip():
+                    doc.add_paragraph(para)
+            
+            temp_dir = tempfile.gettempdir()
+            filepath = os.path.join(temp_dir, filename)
+            doc.save(filepath)
+            return filepath
+        except Exception as e:
+            logger.error("Ошибка создания DOCX: %s", e)
+            raise
+
+    async def shutdown(self):
+        try:
+            if self.redis:
+                await self.redis.close()
+            if self.bot:
+                await self.bot.session.close()
+        except Exception as e:
+            logger.error("Ошибка завершения: %s", e)
+
+    # Добавленный метод run для запуска бота
+    async def run(self):
+        await self.initialize()
+        try:
+            await self.dp.start_polling(self.bot)
+        except Exception as e:
+            logger.critical("Критическая ошибка: %s", e)
+        finally:
+            await self.shutdown()
 
 if __name__ == "__main__":
     app = BotApplication()
