@@ -88,10 +88,12 @@ class BotApplication:
 
         class DocGenState(StatesGroup):
             waiting_for_initial_input = State()
-            waiting_for_parties_info = State()  # Новое состояние для информации о сторонах
+            waiting_for_rent_details = State()  # Детали аренды
+            waiting_for_parties_info = State()
             current_variable = State()
             document_review = State()
             waiting_for_special_terms = State()
+            waiting_for_additional_clauses = State()  # Дополнительные условия
         
         self.states = DocGenState
         self.register_handlers()
@@ -116,18 +118,24 @@ class BotApplication:
                 Ответь в формате JSON:
                 {
                     "roles": {
-                        "Роль1": {
-                            "fields": ["ТИП_ЛИЦА", "ПАСПОРТНЫЕ_ДАННЫЕ_ИЛИ_РЕКВИЗИТЫ", "ИНН", "ОГРНИП_ИЛИ_ОГРН", "БАНКОВСКИЕ_РЕКВИЗИТЫ"]
+                        "Арендодатель": {
+                            "fields": ["ТИП_ЛИЦА", "ПАСПОРТНЫЕ_ДАННЫЕ", "ИНН", "ОГРНИП_ИЛИ_ОГРН", "БАНКОВСКИЕ_РЕКВИЗИТЫ"]
                         },
-                        "Роль2": {
-                            "fields": ["ТИП_ЛИЦА", "ПАСПОРТНЫЕ_ДАННЫЕ_ИЛИ_РЕКВИЗИТЫ", "ИНН", "ОГРНИП_ИЛИ_ОГРН"]
+                        "Арендатор": {
+                            "fields": ["ТИП_ЛИЦА", "ПАСПОРТНЫЕ_ДАННЫЕ", "ИНН", "ОГРНИП_ИЛИ_ОГРН", "БАНКОВСКИЕ_РЕКВИЗИТЫ"]
                         }
                     },
                     "field_descriptions": {
                         "ТИП_ЛИЦА": "Тип лица (физическое лицо, ИП, ООО)",
                         "ПЛОЩАДЬ": "Площадь помещения в кв.м.",
                         "КАДАСТРОВЫЙ_НОМЕР": "Кадастровый номер помещения",
-                        "НДС": "Включен ли НДС в арендную плату (да/нет)"
+                        "АРЕНДНАЯ_ПЛАТА": "Сумма арендной платы",
+                        "СРОК_АРЕНДЫ": "Срок действия договора",
+                        "ДАТА_НАЧАЛА": "Дата начала аренды",
+                        "ДАТА_ОКОНЧАНИЯ": "Дата окончания аренды",
+                        "СТАВКА_НДС": "Ставка НДС (%)",
+                        "КОММУНАЛЬНЫЕ_ПЛАТЕЖИ": "Кто оплачивает коммунальные платежи",
+                        "ДЕПОЗИТ": "Сумма депозита"
                     }
                 }""",
                 user_prompt=f"Документ:\n{document_text}",
@@ -213,9 +221,13 @@ class BotApplication:
             try:
                 await state.clear()
                 await message.answer(
-                    "👋 Привет! Я помогу составить юридический документ.\n\n"
-                    "Просто опиши, какой документ тебе нужен. Например:\n"
-                    "<i>Нужен договор аренды офиса между ИП и ООО на год</i>"
+                    "🏢 <b>Юридический помощник по аренде коммерческой недвижимости</b>\n\n"
+                    "Я помогу составить договор аренды для вашего бизнеса:\n"
+                    "- Кофейни, магазина, салона красоты\n"
+                    "- Офиса или коворкинга\n"
+                    "- Производственного помещения\n\n"
+                    "Просто опишите, какой договор вам нужен. Например:\n"
+                    "<i>Нужен договор аренды офиса 30 м² в Москве на 1 год</i>"
                 )
                 await state.set_state(self.states.waiting_for_initial_input)
             except Exception as e:
@@ -231,22 +243,108 @@ class BotApplication:
 
                 await state.update_data(initial_text=message.text)
                 
-                # Запрашиваем информацию о сторонах
-                await message.answer(
-                    "👥 Теперь укажите стороны договора.\n\n"
-                    "Примеры:\n"
-                    "<i>Арендодатель: ООО 'Ромашка'\n"
-                    "Арендатор: ИП Иванов Иван Иванович</i>\n\n"
-                    "Или:\n"
-                    "<i>Продавец: Петров Петр Петрович (физлицо)\n"
-                    "Покупатель: ООО 'Лютик'</i>\n\n"
-                    "📌 <b>Внимание:</b> Укажите как минимум две стороны договора."
-                )
-                await state.set_state(self.states.waiting_for_parties_info)
+                # Проверяем, относится ли запрос к аренде
+                is_rental = any(keyword in message.text.lower() for keyword in 
+                               ["аренд", "съем", "помещен", "площад", "офис", "магазин", "кафе", "салон"])
+                
+                await state.update_data(is_rental=is_rental)
+                
+                # Определяем тип бизнеса
+                business_type = "other"
+                text_lower = message.text.lower()
+                if any(kw in text_lower for kw in ["кафе", "кофейн", "ресторан", "столов", "бар"]):
+                    business_type = "cafe"
+                elif any(kw in text_lower for kw in ["магазин", "торгов", "рознич", "бутик"]):
+                    business_type = "shop"
+                elif any(kw in text_lower for kw in ["салон красот", "парикмахер", "ногтев", "косметолог"]):
+                    business_type = "beauty"
+                
+                await state.update_data(business_type=business_type)
+                
+                if is_rental:
+                    await message.answer(
+                        "🏢 <b>Уточните детали аренды:</b>\n\n"
+                        "1. <b>Тип помещения:</b>\n"
+                        "   - Офисное\n   - Торговое\n   - Производственное\n   - Складское\n"
+                        "2. <b>Площадь:</b> (в кв.м.)\n"
+                        "3. <b>Мебель/техника:</b> (да/нет)\n"
+                        "4. <b>Система налогообложения арендодателя:</b> (ОСН/УСН/Патент)\n"
+                        "5. <b>Особые условия:</b> (депозит, коммунальные платежи, субаренда)\n\n"
+                        "<i>Пример: Офисное помещение 35 м², без мебели, арендодатель на УСН, "
+                        "коммунальные платежи включены в аренду, депозит 2 месяца</i>"
+                    )
+                    await state.set_state(self.states.waiting_for_rent_details)
+                else:
+                    await message.answer(
+                        "👥 <b>Укажите стороны договора:</b>\n\n"
+                        "<i>Пример:\nАрендодатель: ООО 'Ромашка'\n"
+                        "Арендатор: Иван Иванов (ИП)</i>"
+                    )
+                    await state.set_state(self.states.waiting_for_parties_info)
                 
             except Exception as e:
                 logger.error("Ошибка обработки: %s\n%s", e, traceback.format_exc())
                 await message.answer("⚠️ Ошибка обработки. Попробуйте снова.")
+                await state.clear()
+
+        @self.dp.message(self.states.waiting_for_rent_details)
+        async def handle_rent_details(message: Message, state: FSMContext):
+            try:
+                rent_details = message.text
+                await state.update_data(rent_details=rent_details)
+                
+                # Извлекаем структурированные параметры аренды
+                async with self.show_loading(message.chat.id, ChatAction.TYPING):
+                    rental_params = await self.extract_rental_params(rent_details)
+                    await state.update_data(rental_params=rental_params)
+                    
+                    # Проверяем обязательные параметры
+                    if not rental_params.get("property_type") or not rental_params.get("area"):
+                        await message.answer(
+                            "⚠️ <b>Не указаны ключевые параметры:</b>\n"
+                            "Пожалуйста, укажите как минимум:\n"
+                            "- Тип помещения\n"
+                            "- Площадь\n\n"
+                            "<i>Пример: Офис 50 м², арендодатель на УСН</i>"
+                        )
+                        return
+                    
+                    # Формируем рекомендации по налогам
+                    tax_system = rental_params.get("tax_system", "").upper()
+                    tax_advice = ""
+                    if tax_system == "УСН":
+                        tax_advice = "✅ Арендодатель на УСН: НДС не начисляется"
+                    elif tax_system == "ОСН":
+                        tax_advice = "⚠️ Арендодатель на ОСН: Включите НДС в стоимость"
+                    else:
+                        tax_advice = "ℹ️ Уточните систему налогообложения арендодателя"
+                    
+                    await message.answer(
+                        f"📋 <b>Параметры аренды:</b>\n"
+                        f"Тип: {rental_params.get('property_type', 'не указан')}\n"
+                        f"Площадь: {rental_params.get('area', 'не указана')} м²\n"
+                        f"Мебель: {rental_params.get('furnished', 'не указано')}\n"
+                        f"Налогообложение: {tax_system}\n\n"
+                        f"{tax_advice}"
+                    )
+                    
+                    # Переходим к сбору информации о сторонах
+                    await message.answer(
+                        "👥 <b>Теперь укажите стороны договора:</b>\n\n"
+                        "<b>Арендодатель:</b>\n"
+                        "- ФИО/Название организации\n"
+                        "- Тип лица (физлицо, ИП, ООО)\n"
+                        "\n<b>Арендатор:</b>\n"
+                        "- ФИО/Название организации\n"
+                        "- Тип лица\n\n"
+                        "<i>Пример:\nАрендодатель: ИП Сидоров А.В.\n"
+                        "Арендатор: ООО 'Вектор'</i>"
+                    )
+                    await state.set_state(self.states.waiting_for_parties_info)
+                
+            except Exception as e:
+                logger.error("Ошибка обработки деталей аренды: %s\n%s", e, traceback.format_exc())
+                await message.answer("⚠️ Ошибка обработки деталей аренды. Попробуйте снова.")
                 await state.clear()
 
         @self.dp.message(self.states.waiting_for_parties_info)
@@ -269,678 +367,4 @@ class BotApplication:
                 await state.update_data(parties_text=parties_text)
                 
                 # Извлекаем информацию о сторонах
-                async with self.show_loading(message.chat.id, ChatAction.TYPING):
-                    parties_info = await self.extract_parties_info(parties_text)
-                    
-                    # Проверяем, что есть минимум две стороны
-                    if len(parties_info.get("parties", [])) < 2:
-                        await message.answer(
-                            "⚠️ Не удалось определить две стороны договора.\n"
-                            "Пожалуйста, укажите как минимум две стороны в формате:\n"
-                            "<code>Роль1: Название/ФИО</code>\n"
-                            "<code>Роль2: Название/ФИО</code>"
-                        )
-                        return
-                        
-                    await state.update_data(parties_info=parties_info)
-                    
-                    # Генерируем черновик с учетом информации о сторонах
-                    data = await state.get_data()
-                    await message.answer("🧠 Генерирую черновик документа с учетом сторон договора...")
-                    
-                    document = await self.generate_gpt_response(
-                        system_prompt="""Ты опытный юрист. Составь юридически корректный документ. 
-                        КРИТИЧЕСКИ ВАЖНЫЕ ПРАВИЛА:
-                        1. Используй информацию о сторонах договора
-                        2. Для физических лиц: указать "действующий от своего имени" и паспортные данные
-                        3. Для ИП: указать "ИП [ФИО], действующий на основании свидетельства ОГРНИП"
-                        4. Для ООО: указать "в лице [ДОЛЖНОСТЬ] [ФИО], действующего на основании устава"
-                        5. В предмете договора обязательно указать:
-                           - Точный адрес с номером помещения
-                           - Площадь помещения
-                           - Кадастровый номер
-                        6. В арендной плате:
-                           - Указать валюту (рубли)
-                           - Уточнить включен ли НДС
-                           - Прописать сумму прописью
-                        7. Добавить разделы:
-                           - Права и обязанности сторон
-                           - Ответственность сторон
-                           - Порядок расторжения
-                           - Форс-мажор
-                           - Реквизиты сторон
-                        8. В подписях указать:
-                           - Для ИП: ИНН и ОГРНИП
-                           - Для физлиц: паспортные данные
-                           - Для ООО: ИНН, ОГРН, КПП
-                        9. Проверить согласованность дат""",
-                        user_prompt=(
-                            f"Описание документа:\n{data['initial_text']}\n\n"
-                            f"Стороны договора:\n{parties_text}"
-                        ),
-                        chat_id=message.chat.id
-                    )
-
-                filename = f"draft_{message.from_user.id}.docx"
-                path = self.save_docx(document, filename)
-                
-                await state.update_data(document_text=document)
-                await message.answer_document(FSInputFile(path))
-                await message.answer(
-                    "📄 Черновик готов! Теперь заполним обязательные реквизиты."
-                )
-                await self.start_variable_filling(message, state)
-                
-            except Exception as e:
-                logger.error("Ошибка обработки информации о сторонах: %s\n%s", e, traceback.format_exc())
-                await message.answer("⚠️ Ошибка обработки информации о сторонах. Попробуйте снова.")
-                await state.clear()
-
-        @self.dp.callback_query(F.data == "skip_variable")
-        async def handle_skip_variable(callback: types.CallbackQuery, state: FSMContext):
-            data = await state.get_data()
-            index = data['current_variable_index'] + 1
-            await state.update_data(current_variable_index=index)
-            await callback.message.delete()
-            await self.ask_next_variable(callback.message, state)
-
-        @self.dp.callback_query(F.data == "dont_know")
-        async def handle_dont_know(callback: types.CallbackQuery, state: FSMContext):
-            data = await state.get_data()
-            current_var = data['variables'][data['current_variable_index']]
-            
-            # Предлагаем варианты для пропущенных значений
-            suggestions = {
-                "дата": datetime.datetime.now().strftime("%d.%m.%Y"),
-                "телефон": "+79990001122",
-                "инн": "1234567890" if "организации" in current_var.lower() else "123456789012",
-                "паспорт": "4510 123456",
-                "сумма": "10 000",
-                "срок": "1 год",
-                "адрес": "г. Москва, ул. Ленина, д. 1",
-                "огрн": "1234567890123"
-            }
-            
-            # Ищем подходящий вариант
-            for pattern, value in suggestions.items():
-                if pattern in current_var.lower():
-                    await callback.message.answer(
-                        f"⚠️ Вы можете использовать временное значение:\n"
-                        f"<code>{value}</code>\n\n"
-                        f"Позже его нужно будет заменить на актуальное!"
-                    )
-                    return
-            
-            await callback.message.answer(
-                "⚠️ Это обязательное поле. Если информация неизвестна, "
-                "введите <code>НЕТ ДАННЫХ</code> и уточните позже"
-            )
-
-        @self.dp.message(self.states.current_variable)
-        async def handle_variable_input(message: Message, state: FSMContext):
-            data = await state.get_data()
-            variables = data['variables']
-            index = data['current_variable_index']
-            current_var = variables[index]
-            role_info = data.get('role_info', {})
-            
-            current_role = "документа"
-            for role_name, role_data in role_info.get("roles", {}).items():
-                if current_var in role_data.get("fields", []):
-                    current_role = role_name
-                    break
-
-            value = message.text
-            error = None
-
-            if "инн" in current_var.lower():
-                if not self.validate_inn(value):
-                    error = (
-                        "❌ Неверный формат ИНН\n"
-                        f"Этот ИНН нужен для: <b>{current_role}</b>\n\n"
-                        "Формат:\n- 10 цифр для организаций\n- 12 цифр для ИП/физлиц\n"
-                        "Пример: <code>1234567890</code> или <code>123456789012</code>"
-                    )
-            
-            elif "телефон" in current_var.lower():
-                if not re.match(r'^\+7\d{10}$', value):
-                    error = (
-                        "❌ Неверный формат телефона\n"
-                        f"Этот телефон нужен для: <b>{current_role}</b>\n\n"
-                        "Формат: +7 и 10 цифр без пробелов\n"
-                        "Пример: <code>+79998887766</code>"
-                    )
-            
-            elif "дата" in current_var.lower():
-                try:
-                    datetime.datetime.strptime(value, '%d.%m.%Y')
-                except ValueError:
-                    error = (
-                        "❌ Неверный формат даты\n"
-                        f"Эта дата нужна для: <b>{current_role}</b>\n\n"
-                        "Используйте формат: ДД.ММ.ГГГГ\n"
-                        "Пример: <code>01.01.2023</code>"
-                    )
-            
-            elif "паспорт" in current_var.lower():
-                if not re.match(r'^\d{4} \d{6}$', value):
-                    error = (
-                        "❌ Неверный формат паспорта\n"
-                        f"Эти данные нужны для: <b>{current_role}</b>\n\n"
-                        "Формат: серия (4 цифры) и номер (6 цифр) через пробел\n"
-                        "Пример: <code>4510 123456</code>"
-                    )
-            
-            elif "сумма" in current_var.lower():
-                if not re.match(r'^[\d\s]+(,\d{1,2})?$', value):
-                    error = (
-                        "❌ Неверный формат суммы\n"
-                        f"Эта сумма нужна для: <b>{current_role}</b>\n\n"
-                        "Используйте цифры (можно с пробелами и запятой для копеек)\n"
-                        "Примеры: <code>10000</code>, <code>15 000</code> или <code>12 345,67</code>"
-                    )
-            
-            elif "огрн" in current_var.lower():
-                if len(value) not in [13, 15] or not value.isdigit():
-                    error = (
-                        "❌ Неверный формат ОГРН/ОГРНИП\n"
-                        f"Этот реквизит нужен для: <b>{current_role}</b>\n\n"
-                        "Формат:\n- 13 цифр для ОГРН\n- 15 цифр для ОГРНИП\n"
-                        "Пример: <code>1234567890123</code>"
-                    )
-            
-            elif "тип_лица" in current_var.lower():
-                if value.lower() not in ["физическое лицо", "ип", "ооо"]:
-                    error = "❌ Укажите корректный тип лица: Физическое лицо, ИП или ООО"
-            
-            elif "площадь" in current_var.lower():
-                if not re.match(r'^\d+(\.\d+)?$', value):
-                    error = "❌ Площадь должна быть числом (разделитель - точка)"
-            
-            elif "кадастровый_номер" in current_var.lower():
-                if not re.match(r'^\d{2}:\d{2}:\d{6,7}:\d+$', value):
-                    error = "❌ Неверный формат кадастрового номера. Пример: 77:01:0001010:123"
-            
-            elif "ндс" in current_var.lower():
-                if value.lower() not in ["да", "нет"]:
-                    error = "❌ Укажите: 'да' если НДС включен, 'нет' если не включен"
-            
-            elif "банковск" in current_var.lower():
-                if len(re.findall(r'\d', value)) < 20:
-                    error = "❌ Укажите полные банковские реквизиты (БИК и расчетный счет)"
-
-            if error:
-                await message.answer(error)
-                return
-
-            filled = data['filled_variables']
-            filled[current_var] = value
-            await state.update_data(
-                filled_variables=filled,
-                current_variable_index=index + 1
-            )
-            await self.ask_next_variable(message, state)
-
-        @self.dp.callback_query(F.data == "confirm_document")
-        async def handle_confirm_document(callback: types.CallbackQuery, state: FSMContext):
-            await callback.message.delete()
-            await self.send_final_document(callback.message, state)
-
-        @self.dp.callback_query(F.data == "edit_document")
-        async def handle_edit_document(callback: types.CallbackQuery, state: FSMContext):
-            await callback.message.delete()
-            await state.set_state(self.states.waiting_for_initial_input)
-            await callback.message.answer("🔄 Введите новый запрос для генерации документа:")
-
-        @self.dp.callback_query(F.data == "add_terms")
-        async def handle_add_terms(callback: types.CallbackQuery, state: FSMContext):
-            await callback.message.answer(
-                "✍️ Хотите добавить особые условия? Напишите их или 'нет':"
-            )
-            await state.set_state(self.states.waiting_for_special_terms)
-
-        @self.dp.message(self.states.waiting_for_special_terms)
-        async def handle_final_additions(message: Message, state: FSMContext):
-            try:
-                data = await state.get_data()
-                
-                if message.text.strip().lower() == "нет":
-                    await self.send_final_document(message, state)
-                    return
-                
-                base_text = data.get("final_document", "")
-                
-                async with self.show_loading(message.chat.id, ChatAction.TYPING):
-                    await message.answer("🔧 Вношу изменения в документ...")
-                    updated_doc = await self.generate_gpt_response(
-                        system_prompt="Ты юридический редактор. Внеси правки, добавив особые условия. Сохрани структуру документа.",
-                        user_prompt=f"Добавь условия в документ:\n{message.text}\n\nДокумент:\n{base_text}",
-                        chat_id=message.chat.id
-                    )
-
-                filename = f"final_{message.from_user.id}.docx"
-                path = self.save_docx(updated_doc, filename)
-                
-                await message.answer_document(FSInputFile(path))
-                await message.answer("✅ Документ обновлен!")
-                await state.clear()
-                
-                if os.path.exists(path):
-                    os.unlink(path)
-                    
-            except Exception as e:
-                logger.error("Ошибка обработки: %s\n%s", e, traceback.format_exc())
-                await message.answer("⚠️ Ошибка обработки. Попробуйте снова.")
-                await state.clear()
-
-    async def extract_parties_info(self, text: str) -> dict:
-        """Извлекает структурированную информацию о сторонах договора"""
-        try:
-            response = await self.generate_gpt_response(
-                system_prompt="""Ты юридический ассистент. Извлеки информацию о сторонах договора. 
-                Ответь в формате JSON:
-                {
-                    "parties": [
-                        {
-                            "role": "Нормализованная роль (Арендодатель, Арендатор, Продавец и т.д.)",
-                            "type": "Тип лица (физическое лицо, ИП, ООО)",
-                            "name": "Название организации или ФИО",
-                            "details": "Дополнительные реквизиты (если указаны)"
-                        }
-                    ]
-                }""",
-                user_prompt=f"Текст с информацией о сторонах:\n{text}",
-                chat_id=None
-            )
-            
-            json_match = re.search(r'\{.*\}', response, re.DOTALL)
-            if json_match:
-                result = json.loads(json_match.group(0))
-            else:
-                result = {"parties": []}
-        except Exception as e:
-            logger.error("Ошибка извлечения информации о сторонах: %s", e)
-            result = {"parties": []}
-        
-        # Если не удалось извлечь автоматически, используем эвристики
-        if not result.get("parties"):
-            parties = []
-            for line in text.split("\n"):
-                if ":" in line:
-                    role_part, _, info = line.partition(":")
-                    role = role_part.strip().capitalize()
-                    # Убираем возможные номера (например, "1. Арендодатель: ...")
-                    if re.match(r'^\d+\.', role):
-                        role = re.sub(r'^\d+\.\s*', '', role)
-                    party_type = self.detect_party_type(info)
-                    parties.append({
-                        "role": role,
-                        "type": party_type,
-                        "name": info.strip(),
-                        "details": ""
-                    })
-            result["parties"] = parties
-        
-        # Логируем результат
-        logger.info("Извлеченная информация о сторонах: %s", result)
-        return result
-
-    def detect_party_type(self, text: str) -> str:
-        """Определяет тип лица по тексту"""
-        text = text.lower()
-        if "ооо" in text or "ао" in text or "зао" in text or "общество" in text:
-            return "ООО"
-        if "ип" in text or "индивидуальный предприниматель" in text:
-            return "ИП"
-        if "физ" in text or "физическое" in text or "фл" in text:
-            return "физическое лицо"
-        return "не определен"
-
-    async def start_variable_filling(self, message: Message, state: FSMContext):
-        data = await state.get_data()
-        document_text = data['document_text']
-        role_info = await self.identify_roles(document_text)
-        
-        all_vars = list(set(re.findall(r'\[(.*?)\]', document_text)))
-        
-        # Добавляем обязательные поля, если их нет
-        required_vars = ["ТИП_ЛИЦА_АРЕНДОДАТЕЛЯ", "ТИП_ЛИЦА_АРЕНДАТОРА", "ПЛОЩАДЬ", "КАДАСТРОВЫЙ_НОМЕР", "НДС"]
-        for var in required_vars:
-            if var not in all_vars:
-                all_vars.append(var)
-                role_info["field_descriptions"][var] = var.replace("_", " ").lower()
-                if "Арендодатель" in role_info.get("roles", {}):
-                    role_info["roles"]["Арендодатель"]["fields"].append(var)
-        
-        # Группируем переменные по ролям
-        grouped_vars = {}
-        for var in all_vars:
-            role = "Общие"
-            for role_name, role_data in role_info.get("roles", {}).items():
-                if var in role_data.get("fields", []):
-                    role = role_name
-                    break
-                    
-            if role not in grouped_vars:
-                grouped_vars[role] = []
-            grouped_vars[role].append(var)
-        
-        # Создаем плоский список с сохранением порядка групп
-        ordered_vars = []
-        var_descriptions = {}
-        
-        # Сначала общие реквизиты
-        if "Общие" in grouped_vars:
-            for var in grouped_vars["Общие"]:
-                ordered_vars.append(var)
-                var_descriptions[var] = self.map_variable_to_question(var, role_info)
-        
-        # Затем специфичные для ролей
-        for role, vars_list in grouped_vars.items():
-            if role == "Общие":
-                continue
-                
-            # Добавляем разделитель
-            ordered_vars.append(f"---{role}---")
-            var_descriptions[f"---{role}---"] = f"🔹 <b>{role}</b>"
-            
-            for var in vars_list:
-                ordered_vars.append(var)
-                var_descriptions[var] = self.map_variable_to_question(var, role_info)
-        
-        # Логирование всех переменных
-        logger.info("Упорядоченные переменные: %s", ordered_vars)
-        
-        await state.update_data(
-            variables=ordered_vars,
-            var_descriptions=var_descriptions,
-            filled_variables={},
-            current_variable_index=0,
-            role_info=role_info  # Сохраняем информацию о ролях
-        )
-        await self.ask_next_variable(message, state)
-
-    async def ask_next_variable(self, message: Message, state: FSMContext):
-        data = await state.get_data()
-        variables = data['variables']
-        var_descriptions = data['var_descriptions']
-        index = data['current_variable_index']
-        
-        if index >= len(variables):
-            await self.prepare_final_document(message, state)
-            return
-            
-        current_var = variables[index]
-        
-        # Если это разделитель группы
-        if current_var.startswith("---"):
-            await message.answer(var_descriptions[current_var])
-            await state.update_data(current_variable_index=index + 1)
-            await self.ask_next_variable(message, state)
-            return
-            
-        description = var_descriptions[current_var]
-        
-        # Формируем клавиатуру с подсказками
-        keyboard_buttons = []
-        
-        # Добавляем кнопку пропуска
-        keyboard_buttons.append(
-            InlineKeyboardButton(text="⏭ Пропустить", callback_data="skip_variable")
-        )
-        
-        # Добавляем кнопку "Не знаю"
-        keyboard_buttons.append(
-            InlineKeyboardButton(text="❓ Не знаю", callback_data="dont_know")
-        )
-        
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[keyboard_buttons])
-        
-        await state.set_state(self.states.current_variable)
-        await message.answer(
-            description,
-            reply_markup=keyboard
-        )
-
-    async def prepare_final_document(self, message: Message, state: FSMContext):
-        data = await state.get_data()
-        document_text = data['document_text']
-        filled_vars = data['filled_variables']
-        
-        # Замена переменных
-        for var in data['variables']:
-            if var.startswith("---"):
-                continue
-                
-            if var in filled_vars:
-                value = filled_vars[var]
-                
-                # Для сумм добавляем прописную форму
-                if "сумма" in var.lower() and value.replace(" ", "").replace(",", ".").replace(".", "", 1).isdigit():
-                    try:
-                        # Преобразуем в число
-                        num_value = float(value.replace(" ", "").replace(",", "."))
-                        # Форматируем как денежную сумму
-                        formatted_value = f"{num_value:,.2f}".replace(",", " ").replace(".", ",")
-                        # Генерируем прописью
-                        whole_part = int(num_value)
-                        fractional_part = int(round((num_value - whole_part) * 100))
-                        words = self.num2words(whole_part)
-                        # Добавляем валюту
-                        currency = "рублей"
-                        if whole_part % 10 == 1 and whole_part % 100 != 11:
-                            currency = "рубль"
-                        elif 2 <= whole_part % 10 <= 4 and (whole_part % 100 < 10 or whole_part % 100 >= 20):
-                            currency = "рубля"
-                            
-                        # Формируем полную строку
-                        value = f"{formatted_value} ({words} {currency}"
-                        if fractional_part > 0:
-                            fractional_words = self.num2words(fractional_part)
-                            fractional_currency = "копеек"
-                            if fractional_part % 10 == 1 and fractional_part % 100 != 11:
-                                fractional_currency = "копейка"
-                            elif 2 <= fractional_part % 10 <= 4 and (fractional_part % 100 < 10 or fractional_part % 100 >= 20):
-                                fractional_currency = "копейки"
-                            value += f" {fractional_words} {fractional_currency}"
-                    except:
-                        pass
-                
-                document_text = re.sub(
-                    rf'\[{re.escape(var)}\]', 
-                    value, 
-                    document_text
-                )
-        
-        # Добавляем блоки с реквизитами
-        if "Арендодатель" in document_text:
-            document_text += (
-                "\n\n**Арендодатель:**\n"
-                f"{filled_vars.get('НАЗВАНИЕ_ОРГАНИЗАЦИИ_АРЕНДОДАТЕЛЯ', '')}\n"
-                f"ИНН: {filled_vars.get('ИНН_АРЕНДОДАТЕЛЯ', '')}\n"
-                f"ОГРН/ОГРНИП: {filled_vars.get('ОГРНИП_ИЛИ_ОГРН_АРЕНДОДАТЕЛЯ', '')}\n"
-                "______________________   / [Подпись] /"
-            )
-            
-        if "Арендатор" in document_text:
-            document_text += (
-                "\n\n**Арендатор:**\n"
-                f"{filled_vars.get('НАЗВАНИЕ_ОРГАНИЗАЦИИ_АРЕНДАТОРА', '')}\n"
-                f"ИНН: {filled_vars.get('ИНН_АРЕНДАТОРА', '')}\n"
-                f"ОГРН/ОГРНИП: {filled_vars.get('ОГРНИП_ИЛИ_ОГРН_АРЕНДАТОРА', '')}\n"
-                "______________________   / [Подпись] /"
-            )
-        
-        async with self.show_loading(message.chat.id, ChatAction.UPLOAD_DOCUMENT):
-            # Автоматическая проверка и фикс
-            reviewed_doc = await self.auto_review_and_fix(document_text, message.chat.id)
-            
-            # Проверка заполненности
-            missing_vars = set(re.findall(r'\[(.*?)\]', reviewed_doc))
-            if missing_vars:
-                await message.answer(
-                    f"⚠️ В документе остались незаполненные поля: {', '.join(missing_vars)}\n"
-                    "Пожалуйста, проверьте документ перед отправкой."
-                )
-            
-            # Сохраняем результат для финального подтверждения
-            filename = f"prefinal_{message.from_user.id}.docx"
-            path = self.save_docx(reviewed_doc, filename)
-            
-            await state.update_data(
-                final_document=reviewed_doc,
-                document_path=path
-            )
-            
-            # Отправляем документ на подтверждение
-            await message.answer_document(FSInputFile(path))
-            
-            # Новая клавиатура с вопросом про особые условия
-            keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [
-                    InlineKeyboardButton(text="✅ Завершить", callback_data="confirm_document"),
-                    InlineKeyboardButton(text="✏️ Добавить условия", callback_data="add_terms")
-                ],
-                [
-                    InlineKeyboardButton(text="🔄 Перегенерировать", callback_data="edit_document")
-                ]
-            ])
-            
-            await message.answer(
-                "📝 Документ готов! Вы можете:\n"
-                "- Завершить и получить финальную версию\n"
-                "- Добавить особые условия\n"
-                "- Перегенерировать документ с нуля",
-                reply_markup=keyboard
-            )
-            await state.set_state(self.states.document_review)
-
-    async def send_final_document(self, message: Message, state: FSMContext):
-        data = await state.get_data()
-        document_text = data.get('final_document', '')
-        
-        if not document_text:
-            await message.answer("⚠️ Ошибка: документ не найден")
-            await state.clear()
-            return
-        
-        # Генерируем финальный DOCX
-        filename = f"Юридический_документ_{datetime.datetime.now().strftime('%d%m%Y')}.docx"
-        final_path = self.save_docx(document_text, filename)
-        
-        await message.answer_document(FSInputFile(final_path))
-        await message.answer(
-            "✅ Документ готов! Рекомендуем:\n"
-            "1. Проверить реквизиты\n"
-            "2. Показать юристу\n"
-            "3. Сохранить копию"
-        )
-        await state.clear()
-
-        # Удаляем временные файлы
-        if os.path.exists(final_path):
-            os.unlink(final_path)
-        
-        temp_path = data.get('document_path', '')
-        if temp_path and os.path.exists(temp_path):
-            os.unlink(temp_path)
-
-    async def auto_review_and_fix(self, document: str, chat_id: int) -> str:
-        try:
-            async with self.show_loading(chat_id, ChatAction.TYPING):
-                reviewed = await self.generate_gpt_response(
-                    system_prompt="""Ты юридический редактор. Проверь документ и ВНЕСИ ИСПРАВЛЕНИЯ:
-                    1. Проверь согласованность дат (дата договора должна быть позже даты начала аренды)
-                    2. Убедись что для физлиц не указаны реквизиты юрлиц
-                    3. Проверь что для ИП не указаны данные гендиректора
-                    4. Проверь наличие всех существенных условий договора
-                    5. Добавь сумму прописью если она указана только цифрами
-                    6. Убедись что указаны:
-                       - Кадастровый номер
-                       - Площадь помещения
-                       - Реквизиты сторон
-                    7. Удали все примерные значения
-                    8. Проверь соответствие типов лиц указанным реквизитам""",
-                    user_prompt=f"Исправь этот документ:\n\n{document}",
-                    chat_id=chat_id
-                )
-            
-            if "```" in reviewed:
-                reviewed = reviewed.split("```")[1]
-            return reviewed.strip()
-        
-        except Exception as e:
-            logger.error("Ошибка проверки: %s", e)
-            return document
-
-    async def generate_gpt_response(self, system_prompt: str, user_prompt: str, chat_id: int) -> str:
-        try:
-            if chat_id:
-                async with self.show_loading(chat_id, ChatAction.TYPING):
-                    response = await self.openai_client.chat.completions.create(
-                        model="gpt-3.5-turbo-0125",
-                        messages=[
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": user_prompt}
-                        ],
-                        temperature=0.2,
-                        max_tokens=3000
-                    )
-            else:
-                response = await self.openai_client.chat.completions.create(
-                    model="gpt-3.5-turbo-0125",
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt}
-                    ],
-                    temperature=0.2,
-                    max_tokens=3000
-                )
-                
-            return response.choices[0].message.content.strip()
-        except Exception as e:
-            logger.error("Ошибка OpenAI: %s", e)
-            return "❌ Ошибка генерации. Попробуйте позже."
-
-    def save_docx(self, text: str, filename: str) -> str:
-        try:
-            doc = Document()
-            for para in text.split("\n"):
-                if para.strip():
-                    doc.add_paragraph(para)
-            
-            temp_dir = tempfile.gettempdir()
-            filepath = os.path.join(temp_dir, filename)
-            doc.save(filepath)
-            return filepath
-        except Exception as e:
-            logger.error("Ошибка создания DOCX: %s", e)
-            raise
-
-    async def shutdown(self):
-        try:
-            if self.redis:
-                await self.redis.close()
-            if self.bot:
-                await self.bot.session.close()
-        except Exception as e:
-            logger.error("Ошибка завершения: %s", e)
-
-    # Метод run для запуска бота
-    async def run(self):
-        await self.initialize()
-        try:
-            await self.dp.start_polling(self.bot)
-        except Exception as e:
-            logger.critical("Критическая ошибка: %s", e)
-        finally:
-            await self.shutdown()
-
-if __name__ == "__main__":
-    app = BotApplication()
-    try:
-        asyncio.run(app.run())
-    except KeyboardInterrupt:
-        logger.info("Бот остановлен")
-    except Exception as e:
-        logger.critical("Фатальная ошибка: %s", e)
+                async with self.show_loading(message.chat.id, Chat
