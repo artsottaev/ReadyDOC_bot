@@ -5,6 +5,7 @@ import asyncio
 import tempfile
 import traceback
 import datetime
+import time
 import httpx
 import json
 from contextlib import asynccontextmanager
@@ -37,6 +38,7 @@ class BotApplication:
         self.redis = None
         self.openai_client = None
         self.states = None
+        self.progress_tasks = {}  # Для отслеживания задач прогресса
         
         # Инициализация компонентов Natasha
         self.segmenter = Segmenter()
@@ -98,6 +100,94 @@ class BotApplication:
         
         self.states = DocGenState
         self.register_handlers()
+
+    async def show_progress(self, chat_id: int, total_steps: int, operation_name: str):
+        """Показывает анимированный прогресс-бар"""
+        try:
+            message = await self.bot.send_message(
+                chat_id,
+                f"🔄 {operation_name}...\n[{self._progress_bar(0)}] 0%"
+            )
+            message_id = message.message_id
+            start_time = time.time()
+            
+            # Запускаем задачу обновления прогресса
+            task = asyncio.create_task(self._update_progress(
+                chat_id, message_id, total_steps, operation_name, start_time
+            ))
+            self.progress_tasks[(chat_id, message_id)] = task
+            return message_id
+        except Exception as e:
+            logger.error(f"Ошибка запуска прогресс-бара: {e}")
+            return None
+
+    async def _update_progress(self, chat_id: int, message_id: int, 
+                              total_steps: int, operation_name: str, start_time: float):
+        """Обновляет прогресс-бар каждые 0.5 секунд"""
+        try:
+            for step in range(1, total_steps + 1):
+                # Рассчитываем процент выполнения
+                percent = min(100, int((step / total_steps) * 100))
+                
+                # Рассчитываем оставшееся время
+                elapsed = time.time() - start_time
+                time_per_step = elapsed / step if step > 0 else 0
+                remaining = max(0, int((total_steps - step) * time_per_step))
+                
+                try:
+                    await self.bot.edit_message_text(
+                        f"🔄 {operation_name}...\n"
+                        f"[{self._progress_bar(percent)}] {percent}%\n"
+                        f"⏱ Осталось: {remaining} сек",
+                        chat_id=chat_id,
+                        message_id=message_id
+                    )
+                except Exception:
+                    pass  # Игнорируем ошибки редактирования
+                
+                await asyncio.sleep(0.5)  # Частота обновления
+            
+            # Финальное сообщение
+            try:
+                await self.bot.edit_message_text(
+                    f"✅ {operation_name} завершено!",
+                    chat_id=chat_id,
+                    message_id=message_id
+                )
+                await asyncio.sleep(2)
+                await self.bot.delete_message(chat_id, message_id)
+            except Exception:
+                pass
+        except asyncio.CancelledError:
+            # Задача была отменена досрочно
+            pass
+        finally:
+            # Удаляем задачу из трекера
+            if (chat_id, message_id) in self.progress_tasks:
+                del self.progress_tasks[(chat_id, message_id)]
+
+    def _progress_bar(self, percent: int, length: int = 20) -> str:
+        """Генерирует строку прогресс-бара"""
+        filled_length = int(percent / 100 * length)
+        filled = '█' * filled_length
+        empty = '▁' * (length - filled_length)
+        return filled + empty
+
+    async def complete_progress(self, chat_id: int, message_id: int):
+        """Завершает прогресс досрочно"""
+        if task := self.progress_tasks.get((chat_id, message_id)):
+            task.cancel()
+            try:
+                await self.bot.edit_message_text(
+                    "✅ Операция завершена!",
+                    chat_id=chat_id,
+                    message_id=message_id
+                )
+                await asyncio.sleep(2)
+                await self.bot.delete_message(chat_id, message_id)
+            except Exception:
+                pass
+            del self.progress_tasks[(chat_id, message_id)]
 
     def extract_entities(self, text: str) -> dict:
         doc = Doc(text)
@@ -314,8 +404,15 @@ class BotApplication:
                 rent_details = message.text
                 await state.update_data(rent_details=rent_details)
                 
-                # Извлекаем структурированные параметры аренды
-                async with self.show_loading(message.chat.id, ChatAction.TYPING):
+                # Запускаем прогресс-бар (оцениваем 8 шагов)
+                progress_id = None
+                try:
+                    progress_id = await self.show_progress(message.chat.id, 8, "Анализ деталей аренды")
+                except Exception as e:
+                    logger.error(f"Ошибка запуска прогресса: {e}")
+                
+                try:
+                    # Извлекаем структурированные параметры аренды
                     rental_params = await self.extract_rental_params(rent_details)
                     await state.update_data(rental_params=rental_params)
                     
@@ -362,6 +459,9 @@ class BotApplication:
                         "Арендатор: ООО 'Вектор'</i>"
                     )
                     await state.set_state(self.states.waiting_for_parties_info)
+                finally:
+                    if progress_id:
+                        await self.complete_progress(message.chat.id, progress_id)
                 
             except Exception as e:
                 logger.error("Ошибка обработки деталей аренды: %s\n%s", e, traceback.format_exc())
@@ -374,8 +474,15 @@ class BotApplication:
                 parties_text = message.text
                 await state.update_data(parties_text=parties_text)
                 
-                # Извлекаем информацию о сторонах
-                async with self.show_loading(message.chat.id, ChatAction.TYPING):
+                # Запускаем прогресс-бар (оцениваем 10 шагов)
+                progress_id = None
+                try:
+                    progress_id = await self.show_progress(message.chat.id, 10, "Анализ сторон договора")
+                except Exception as e:
+                    logger.error(f"Ошибка запуска прогресса: {e}")
+                
+                try:
+                    # Извлекаем информацию о сторонах
                     parties_info = await self.extract_parties_info(parties_text)
                     
                     # Проверяем, что есть минимум две стороны
@@ -417,6 +524,9 @@ class BotApplication:
                     
                     await state.update_data(parties_info=parties_info)
                     await state.set_state(self.states.parties_confirmation)
+                finally:
+                    if progress_id:
+                        await self.complete_progress(message.chat.id, progress_id)
                 
             except Exception as e:
                 logger.error("Ошибка обработки информации о сторонах: %s\n%s", e, traceback.format_exc())
@@ -428,96 +538,107 @@ class BotApplication:
             await callback.message.delete()
             data = await state.get_data()
             
-            # Генерируем черновик с учетом информации о сторонах
-            await callback.message.answer("🧠 Генерирую договор аренды...")
+            # Запускаем прогресс-бар (оцениваем 15 шагов)
+            progress_id = None
+            try:
+                progress_id = await self.show_progress(callback.message.chat.id, 15, "Генерация договора")
+            except Exception as e:
+                logger.error(f"Ошибка запуска прогресса: {e}")
             
-            # Формируем промпт с учетом специализации
-            rental_params = data.get('rental_params', {})
-            business_type = data.get('business_type', 'other')
-            
-            # Добавляем специфичные условия для разных типов бизнеса
-            business_specific = ""
-            if business_type == "cafe":
-                business_specific = (
-                    "ДОБАВЬ СПЕЦИФИЧНЫЕ УСЛОВИЯ ДЛЯ ОБЩЕПИТА:\n"
-                    " - Требования СЭС\n - Правила пожарной безопасности\n"
-                    " - Утилизация отходов\n - График поставок продуктов\n"
-                )
-            elif business_type == "shop":
-                business_specific = (
-                    "ДОБАВЬ СПЕЦИФИЧНЫЕ УСЛОВИЯ ДЛЯ МАГАЗИНОВ:\n"
-                    " - Режим работы\n - Требования к витринам\n"
-                    " - Ответственность за кражу товара\n"
-                )
-            elif business_type == "beauty":
-                business_specific = (
-                    "ДОБАВЬ СПЕЦИФИЧНЫЕ УСЛОВИЯ ДЛЯ САЛОНОВ КРАСОТЫ:\n"
-                    " - Санитарные нормы\n - Лицензии на процедуры\n"
-                    " - Утилизация расходных материалов\n"
-                )
-            
-            rent_specific_prompt = f"""
-            Дополнительные параметры аренды:
-            - Тип помещения: {rental_params.get('property_type', 'не указан')}
-            - Площадь: {rental_params.get('area', 'не указана')} м²
-            - Мебель/техника: {rental_params.get('furnished', 'не указано')}
-            - Налогообложение арендодателя: {rental_params.get('tax_system', 'не указано')}
-            {business_specific}
-            """
-            
-            document = await self.generate_gpt_response(
-                system_prompt=f"""Ты юрист, специализирующийся на аренде коммерческой недвижимости. 
-                Составь юридически корректный договор аренды с учетом:
-                1. Статьи 606-625 ГК РФ
-                2. Особенностей налогообложения: {rental_params.get('tax_system', '')}
-                3. Требований к коммерческой аренде
-                4. Практики аренды в России
-                {rent_specific_prompt}
+            try:
+                # Генерируем черновик с учетом информации о сторонах
+                await callback.message.answer("🧠 Генерирую договор аренды...")
                 
-                ВАЖНО: Для всех переменных данных используй ТОЛЬКО плейсхолдеры в квадратных скобках в формате [НАЗВАНИЕ_ПЕРЕМЕННОЙ]. 
-                Никогда не используй фразы вроде "Указать дату окончания" - вместо этого используй [ДАТА_ОКОНЧАНИЯ].
+                # Формируем промпт с учетом специализации
+                rental_params = data.get('rental_params', {})
+                business_type = data.get('business_type', 'other')
                 
-                КРИТИЧЕСКИ ВАЖНЫЕ ПРАВИЛА:
-                1. Для физических лиц: указать "действующий от своего имени" и паспортные данные
-                2. Для ИП: указать "ИП [ФИО], действующий на основании свидетельства ОГРНИП"
-                3. Для ООО: указать "в лице [ДОЛЖНОСТЬ] [ФИО], действующего на основании устава"
-                4. В предмете договора обязательно указать:
-                   - Точный адрес с номером помещения: [АДРЕС_ОБЪЕКТА]
-                   - Площадь помещения: [ПЛОЩАДЬ] м²
-                   - Кадастровый номер: [КАДАСТРОВЫЙ_НОМЕР]
-                5. В арендной плате:
-                   - Указать валюту (рубли)
-                   - Уточнить включен ли НДС (для ОСН - обязательно): [СТАВКА_НДС]
-                   - Прописать сумму прописью: [АРЕНДНАЯ_ПЛАТА_ПРОПИСЬЮ]
-                6. Добавить разделы:
-                   - Коммунальные платежи: [КОММУНАЛЬНЫЕ_ПЛАТЕЖИ]
-                   - Порядок расторжения
-                   - Реквизиты сторон
-                   - Ответственность сторон
-                   - Форс-мажор
-                7. В подписях указать:
-                   - Для ИП: ИНН и ОГРНИП
-                   - Для физлиц: паспортные данные
-                   - Для ООО: ИНН, ОГРН, КПП
-                8. Проверить согласованность дат:
-                   - Дата начала: [ДАТА_НАЧАЛА]
-                   - Дата окончания: [ДАТА_ОКОНЧАНИЯ]""",
-                user_prompt=(
-                    f"Описание документа:\n{data['initial_text']}\n\n"
-                    f"Стороны договора:\n{data['parties_text']}"
-                ),
-                chat_id=callback.message.chat.id
-            )
+                # Добавляем специфичные условия для разных типов бизнеса
+                business_specific = ""
+                if business_type == "cafe":
+                    business_specific = (
+                        "ДОБАВЬ СПЕЦИФИЧНЫЕ УСЛОВИЯ ДЛЯ ОБЩЕПИТА:\n"
+                        " - Требования СЭС\n - Правила пожарной безопасности\n"
+                        " - Утилизация отходов\n - График поставок продуктов\n"
+                    )
+                elif business_type == "shop":
+                    business_specific = (
+                        "ДОБАВЬ СПЕЦИФИЧНЫЕ УСЛОВИЯ ДЛЯ МАГАЗИНОВ:\n"
+                        " - Режим работы\n - Требования к витринам\n"
+                        " - Ответственность за кражу товара\n"
+                    )
+                elif business_type == "beauty":
+                    business_specific = (
+                        "ДОБАВЬ СПЕЦИФИЧНЫЕ УСЛОВИЯ ДЛЯ САЛОНОВ КРАСОТЫ:\n"
+                        " - Санитарные нормы\n - Лицензии на процедуры\n"
+                        " - Утилизация расходных материалов\n"
+                    )
+                
+                rent_specific_prompt = f"""
+                Дополнительные параметры аренды:
+                - Тип помещения: {rental_params.get('property_type', 'не указан')}
+                - Площадь: {rental_params.get('area', 'не указана')} м²
+                - Мебель/техника: {rental_params.get('furnished', 'не указано')}
+                - Налогообложение арендодателя: {rental_params.get('tax_system', 'не указано')}
+                {business_specific}
+                """
+                
+                document = await self.generate_gpt_response(
+                    system_prompt=f"""Ты юрист, специализирующийся на аренде коммерческой недвижимости. 
+                    Составь юридически корректный договор аренды с учетом:
+                    1. Статьи 606-625 ГК РФ
+                    2. Особенностей налогообложения: {rental_params.get('tax_system', '')}
+                    3. Требований к коммерческой аренде
+                    4. Практики аренды в России
+                    {rent_specific_prompt}
+                    
+                    ВАЖНО: Для всех переменных данных используй ТОЛЬКО плейсхолдеры в квадратных скобках в формате [НАЗВАНИЕ_ПЕРЕМЕННОЙ]. 
+                    Никогда не используй фразы вроде "Указать дату окончания" - вместо этого используй [ДАТА_ОКОНЧАНИЯ].
+                    
+                    КРИТИЧЕСКИ ВАЖНЫЕ ПРАВИЛА:
+                    1. Для физических лиц: указать "действующий от своего имени" и паспортные данные
+                    2. Для ИП: указать "ИП [ФИО], действующий на основании свидетельства ОГРНИП"
+                    3. Для ООО: указать "в лице [ДОЛЖНОСТЬ] [ФИО], действующего на основании устава"
+                    4. В предмете договора обязательно указать:
+                       - Точный адрес с номером помещения: [АДРЕС_ОБЪЕКТА]
+                       - Площадь помещения: [ПЛОЩАДЬ] м²
+                       - Кадастровый номер: [КАДАСТРОВЫЙ_НОМЕР]
+                    5. В арендной плате:
+                       - Указать валюту (рубли)
+                       - Уточнить включен ли НДС (для ОСН - обязательно): [СТАВКА_НДС]
+                       - Прописать сумму прописью: [АРЕНДНАЯ_ПЛАТА_ПРОПИСЬЮ]
+                    6. Добавить разделы:
+                       - Коммунальные платежи: [КОММУНАЛЬНЫЕ_ПЛАТЕЖИ]
+                       - Порядок расторжения
+                       - Реквизиты сторон
+                       - Ответственность сторон
+                       - Форс-мажор
+                    7. В подписях указать:
+                       - Для ИП: ИНН и ОГРНИП
+                       - Для физлиц: паспортные данные
+                       - Для ООО: ИНН, ОГРН, КПП
+                    8. Проверить согласованность дат:
+                       - Дата начала: [ДАТА_НАЧАЛА]
+                       - Дата окончания: [ДАТА_ОКОНЧАНИЯ]""",
+                    user_prompt=(
+                        f"Описание документа:\n{data['initial_text']}\n\n"
+                        f"Стороны договора:\n{data['parties_text']}"
+                    ),
+                    chat_id=callback.message.chat.id
+                )
 
-            filename = f"draft_{callback.message.from_user.id}.docx"
-            path = self.save_docx(document, filename)
-            
-            await state.update_data(document_text=document)
-            await callback.message.answer_document(FSInputFile(path))
-            await callback.message.answer(
-                "📄 Черновик договора готов! Теперь заполним обязательные реквизиты."
-            )
-            await self.start_variable_filling(callback.message, state)
+                filename = f"draft_{callback.message.from_user.id}.docx"
+                path = self.save_docx(document, filename)
+                
+                await state.update_data(document_text=document)
+                await callback.message.answer_document(FSInputFile(path))
+                await callback.message.answer(
+                    "📄 Черновик договора готов! Теперь заполним обязательные реквизиты."
+                )
+                await self.start_variable_filling(callback.message, state)
+            finally:
+                if progress_id:
+                    await self.complete_progress(callback.message.chat.id, progress_id)
 
         @self.dp.callback_query(F.data == "parties_correct")
         async def handle_parties_correct(callback: types.CallbackQuery, state: FSMContext):
@@ -552,7 +673,14 @@ class BotApplication:
                 data = await state.get_data()
                 base_text = data.get("final_document", "")
                 
-                async with self.show_loading(message.chat.id, ChatAction.TYPING):
+                # Запускаем прогресс-бар (оцениваем 5 шагов)
+                progress_id = None
+                try:
+                    progress_id = await self.show_progress(message.chat.id, 5, "Добавление условий")
+                except Exception as e:
+                    logger.error(f"Ошибка запуска прогресса: {e}")
+                
+                try:
                     await message.answer("🔧 Добавляю выбранные условия в договор...")
                     updated_doc = await self.generate_gpt_response(
                         system_prompt="Ты юридический редактор. Добавь в договор аренды выбранные условия.",
@@ -560,29 +688,32 @@ class BotApplication:
                         chat_id=message.chat.id
                     )
 
-                filename = f"updated_{message.from_user.id}.docx"
-                path = self.save_docx(updated_doc, filename)
-                
-                await message.answer_document(FSInputFile(path))
-                await message.answer("✅ Договор обновлен с учетом выбранных условий!")
-                
-                # Обновляем финальный документ
-                await state.update_data(final_document=updated_doc)
-                
-                # Предлагаем финальные действия
-                keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                    [
-                        InlineKeyboardButton(text="✅ Завершить", callback_data="confirm_document"),
-                        InlineKeyboardButton(text="✏️ Добавить свои условия", callback_data="add_terms")
-                    ]
-                ])
-                
-                await message.answer(
-                    "Вы можете:\n"
-                    "- Завершить и получить финальную версию\n"
-                    "- Добавить свои особые условия",
-                    reply_markup=keyboard
-                )
+                    filename = f"updated_{message.from_user.id}.docx"
+                    path = self.save_docx(updated_doc, filename)
+                    
+                    await message.answer_document(FSInputFile(path))
+                    await message.answer("✅ Договор обновлен с учетом выбранных условий!")
+                    
+                    # Обновляем финальный документ
+                    await state.update_data(final_document=updated_doc)
+                    
+                    # Предлагаем финальные действия
+                    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                        [
+                            InlineKeyboardButton(text="✅ Завершить", callback_data="confirm_document"),
+                            InlineKeyboardButton(text="✏️ Добавить свои условия", callback_data="add_terms")
+                        ]
+                    ])
+                    
+                    await message.answer(
+                        "Вы можете:\n"
+                        "- Завершить и получить финальную версию\n"
+                        "- Добавить свои особые условия",
+                        reply_markup=keyboard
+                    )
+                finally:
+                    if progress_id:
+                        await self.complete_progress(message.chat.id, progress_id)
                     
             except Exception as e:
                 logger.error("Ошибка обработки: %s\n%s", e, traceback.format_exc())
@@ -657,27 +788,37 @@ class BotApplication:
                 data = await state.get_data()
                 base_text = data.get("final_document", "")
                 
-                async with self.show_loading(message.chat.id, ChatAction.TYPING):
+                # Запускаем прогресс-бар (оцениваем 5 шагов)
+                progress_id = None
+                try:
+                    progress_id = await self.show_progress(message.chat.id, 5, "Добавление условий")
+                except Exception as e:
+                    logger.error(f"Ошибка запуска прогресса: {e}")
+                
+                try:
                     updated_doc = await self.generate_gpt_response(
                         system_prompt="Ты юридический редактор. Добавь в договор аренды пользовательские условия.",
                         user_prompt=f"Добавь эти особые условия: {custom_terms}\n\nВ текущий договор:\n{base_text}",
                         chat_id=message.chat.id
                     )
 
-                filename = f"custom_{message.from_user.id}.docx"
-                path = self.save_docx(updated_doc, filename)
-                
-                await message.answer_document(FSInputFile(path))
-                await message.answer("✅ Особые условия добавлены в договор!")
-                
-                # Обновляем документ в состоянии
-                await state.update_data(final_document=updated_doc)
-                
-                # Предлагаем финальные действия
-                keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="✅ Завершить", callback_data="confirm_document")]
-                ])
-                await message.answer("Документ обновлен. Вы можете завершить оформление.", reply_markup=keyboard)
+                    filename = f"custom_{message.from_user.id}.docx"
+                    path = self.save_docx(updated_doc, filename)
+                    
+                    await message.answer_document(FSInputFile(path))
+                    await message.answer("✅ Особые условия добавлены в договор!")
+                    
+                    # Обновляем документ в состоянии
+                    await state.update_data(final_document=updated_doc)
+                    
+                    # Предлагаем финальные действия
+                    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="✅ Завершить", callback_data="confirm_document")]
+                    ])
+                    await message.answer("Документ обновлен. Вы можете завершить оформление.", reply_markup=keyboard)
+                finally:
+                    if progress_id:
+                        await self.complete_progress(message.chat.id, progress_id)
                     
             except Exception as e:
                 logger.error("Ошибка добавления условий: %s", e)
@@ -998,7 +1139,18 @@ class BotApplication:
             index += 1
             
         if index >= len(variables):
-            await self.prepare_final_document(message, state)
+            # Запускаем прогресс-бар для подготовки документа (оцениваем 5 шагов)
+            progress_id = None
+            try:
+                progress_id = await self.show_progress(message.chat.id, 5, "Подготовка документа")
+            except Exception as e:
+                logger.error(f"Ошибка запуска прогресса: {e}")
+            
+            try:
+                await self.prepare_final_document(message, state)
+            finally:
+                if progress_id:
+                    await self.complete_progress(message.chat.id, progress_id)
             return
             
         current_var = variables[index]
@@ -1105,27 +1257,38 @@ class BotApplication:
             
             # Для аренды генерируем дополнительные документы
             if data.get('is_rental', False):
-                await message.answer("📝 <b>Генерирую дополнительные документы...</b>")
+                # Прогресс-бар для генерации доп. документов
+                progress_id = None
+                try:
+                    progress_id = await self.show_progress(message.chat.id, 3, "Генерация документов")
+                except Exception as e:
+                    logger.error(f"Ошибка запуска прогресса: {e}")
                 
-                # Акт приема-передачи
-                act_text = await self.generate_acceptance_act(data)
-                act_path = self.save_docx(act_text, "Акт_приема-передачи.docx")
-                await message.answer_document(FSInputFile(act_path))
-                
-                # Уведомление о расторжении
-                termination_text = await self.generate_termination_notice(data)
-                term_path = self.save_docx(termination_text, "Уведомление_о_расторжении.docx")
-                await message.answer_document(FSInputFile(term_path))
-                
-                # Дополнительные рекомендации
-                await message.answer(
-                    "🔔 <b>Рекомендации по договору аренды:</b>\n\n"
-                    "1. Подпишите акт приема-передачи при заселении\n"
-                    "2. Храните все платежные документы\n"
-                    "3. Уведомляйте о расторжении за 1 месяц\n"
-                    "4. Проверьте регистрацию договора, если срок > 1 года\n\n"
-                    "Для консультации по налогам используйте /tax_help"
-                )
+                try:
+                    await message.answer("📝 <b>Генерирую дополнительные документы...</b>")
+                    
+                    # Акт приема-передачи
+                    act_text = await self.generate_acceptance_act(data)
+                    act_path = self.save_docx(act_text, "Акт_приема-передачи.docx")
+                    await message.answer_document(FSInputFile(act_path))
+                    
+                    # Уведомление о расторжении
+                    termination_text = await self.generate_termination_notice(data)
+                    term_path = self.save_docx(termination_text, "Уведомление_о_расторжении.docx")
+                    await message.answer_document(FSInputFile(term_path))
+                    
+                    # Дополнительные рекомендации
+                    await message.answer(
+                        "🔔 <b>Рекомендации по договору аренды:</b>\n\n"
+                        "1. Подпишите акт приема-передачи при заселении\n"
+                        "2. Храните все платежные документы\n"
+                        "3. Уведомляйте о расторжении за 1 месяц\n"
+                        "4. Проверьте регистрацию договора, если срок > 1 года\n\n"
+                        "Для консультации по налогам используйте /tax_help"
+                    )
+                finally:
+                    if progress_id:
+                        await self.complete_progress(message.chat.id, progress_id)
             else:
                 await message.answer("✅ Документ готов! Рекомендуем проверить его у юриста.")
             
@@ -1265,6 +1428,10 @@ class BotApplication:
 
     async def shutdown(self):
         try:
+            # Отменяем все активные задачи прогресса
+            for task in self.progress_tasks.values():
+                task.cancel()
+                
             if self.redis:
                 await self.redis.close()
             if self.bot:
