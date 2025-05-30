@@ -633,6 +633,57 @@ class BotApplication:
                 await message.answer("⚠️ Ошибка обработки. Попробуйте снова.")
                 await state.clear()
 
+        # НОВЫЕ ОБРАБОТЧИКИ ДЛЯ КНОПОК
+        @self.dp.callback_query(F.data == "confirm_document")
+        async def handle_confirm_document(callback: types.CallbackQuery, state: FSMContext):
+            try:
+                await callback.message.delete()
+                await self.send_final_document(callback.message, state)
+            except Exception as e:
+                logger.error("Ошибка подтверждения документа: %s", e)
+                await callback.message.answer("⚠️ Ошибка завершения оформления. Попробуйте снова.")
+
+        @self.dp.callback_query(F.data == "add_terms")
+        async def handle_add_terms(callback: types.CallbackQuery, state: FSMContext):
+            await callback.message.answer(
+                "✏️ Введите ваши особые условия, которые нужно добавить в договор:"
+            )
+            await state.set_state(self.states.waiting_for_special_terms)
+
+        @self.dp.message(self.states.waiting_for_special_terms)
+        async def handle_special_terms(message: Message, state: FSMContext):
+            try:
+                custom_terms = message.text
+                data = await state.get_data()
+                base_text = data.get("final_document", "")
+                
+                async with self.show_loading(message.chat.id, ChatAction.TYPING):
+                    updated_doc = await self.generate_gpt_response(
+                        system_prompt="Ты юридический редактор. Добавь в договор аренды пользовательские условия.",
+                        user_prompt=f"Добавь эти особые условия: {custom_terms}\n\nВ текущий договор:\n{base_text}",
+                        chat_id=message.chat.id
+                    )
+
+                filename = f"custom_{message.from_user.id}.docx"
+                path = self.save_docx(updated_doc, filename)
+                
+                await message.answer_document(FSInputFile(path))
+                await message.answer("✅ Особые условия добавлены в договор!")
+                
+                # Обновляем документ в состоянии
+                await state.update_data(final_document=updated_doc)
+                
+                # Предлагаем финальные действия
+                keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="✅ Завершить", callback_data="confirm_document")]
+                ])
+                await message.answer("Документ обновлен. Вы можете завершить оформление.", reply_markup=keyboard)
+                    
+            except Exception as e:
+                logger.error("Ошибка добавления условий: %s", e)
+                await message.answer("⚠️ Ошибка обработки. Попробуйте снова.")
+                await state.set_state(self.states.document_review)
+
     async def extract_rental_params(self, text: str) -> dict:
         """Извлекает структурированные параметры аренды из текста с резервной логикой"""
         try:
@@ -979,97 +1030,157 @@ class BotApplication:
         await state.set_state(self.states.current_variable)  # Устанавливаем состояние для ввода
 
     async def prepare_final_document(self, message: Message, state: FSMContext):
-        data = await state.get_data()
-        document_text = data['document_text']
-        filled = data['filled_variables']
-        
-        # Заменяем плейсхолдеры значениями
-        for var, value in filled.items():
-            document_text = document_text.replace(f"[{var}]", value)
-        
-        # Автоматическая проверка документа
-        async with self.show_loading(message.chat.id, ChatAction.TYPING):
-            await message.answer("🔍 Проверяю документ на соответствие законодательству...")
-            reviewed_doc = await self.auto_review_and_fix(document_text, message.chat.id)
-        
-        # Сохраняем финальную версию
-        await state.update_data(final_document=reviewed_doc)
-        
-        # Отправляем пользователю
-        filename = f"final_{message.from_user.id}.docx"
-        path = self.save_docx(reviewed_doc, filename)
-        await message.answer_document(FSInputFile(path))
-        await state.set_state(self.states.document_review)
-        
-        # Предлагаем дополнительные опции
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text="✅ Завершить", callback_data="confirm_document"),
-                InlineKeyboardButton(text="📝 Добавить условия", callback_data="add_clauses")
-            ]
-        ])
-        
-        await message.answer(
-            "📑 Договор готов! Вы можете:\n"
-            "- Завершить оформление\n"
-            "- Добавить дополнительные условия",
-            reply_markup=keyboard
-        )
+        try:
+            data = await state.get_data()
+            document_text = data['document_text']
+            filled = data['filled_variables']
+            
+            # Заменяем плейсхолдеры значениями
+            for var, value in filled.items():
+                document_text = document_text.replace(f"[{var}]", value)
+            
+            # Особые преобразования
+            if 'АРЕНДНАЯ_ПЛАТА' in filled:
+                amount = int(filled['АРЕНДНАЯ_ПЛАТА'])
+                document_text = document_text.replace(
+                    "[АРЕНДНАЯ_ПЛАТА_ПРОПИСЬЮ]", 
+                    f"{amount} ({self.num2words(amount)}) рублей"
+                )
+            
+            # Проверка документа
+            async with self.show_loading(message.chat.id, ChatAction.TYPING):
+                await message.answer("🔍 Проверяю документ...")
+                reviewed_doc = await self.auto_review_and_fix(document_text, message.chat.id)
+                
+                # Дополнительная проверка, что вернулся именно документ
+                if "договор" not in reviewed_doc.lower() and "аренд" not in reviewed_doc.lower():
+                    logger.warning("GPT вернул не документ: %s", reviewed_doc[:100])
+                    reviewed_doc = document_text  # Используем исходную версию
+            
+            # Сохраняем финальную версию
+            await state.update_data(final_document=reviewed_doc)
+            
+            # Отправляем пользователю
+            filename = f"final_{message.from_user.id}.docx"
+            path = self.save_docx(reviewed_doc, filename)
+            await message.answer_document(FSInputFile(path))
+            await state.set_state(self.states.document_review)
+            
+            # Предлагаем дополнительные опции
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="✅ Завершить", callback_data="confirm_document"),
+                    InlineKeyboardButton(text="📝 Добавить условия", callback_data="add_clauses"),
+                    InlineKeyboardButton(text="✏️ Свои условия", callback_data="add_terms")
+                ]
+            ])
+            
+            await message.answer(
+                "📑 Договор готов! Вы можете:\n"
+                "- Завершить оформление\n"
+                "- Добавить стандартные условия\n"
+                "- Добавить свои особые условия",
+                reply_markup=keyboard
+            )
+            
+        except Exception as e:
+            logger.error("Ошибка подготовки документа: %s", e)
+            await message.answer("⚠️ Ошибка формирования документа. Попробуйте снова.")
+            await state.clear()
 
     async def send_final_document(self, message: Message, state: FSMContext):
-        data = await state.get_data()
-        document_text = data.get('final_document', '')
-        
-        if not document_text:
-            await message.answer("⚠️ Ошибка: документ не найден")
-            await state.clear()
-            return
-        
-        # Генерируем финальный DOCX
-        filename = f"Договор_аренды_{datetime.datetime.now().strftime('%d%m%Y')}.docx"
-        final_path = self.save_docx(document_text, filename)
-        
-        await message.answer_document(FSInputFile(final_path))
-        
-        # Для аренды генерируем дополнительные документы
-        if data.get('is_rental'):
-            await message.answer("📝 <b>Генерирую дополнительные документы...</b>")
+        try:
+            data = await state.get_data()
+            document_text = data.get('final_document', '')
             
-            # Акт приема-передачи
-            act_text = await self.generate_acceptance_act(data)
-            act_path = self.save_docx(act_text, "Акт_приема-передачи.docx")
-            await message.answer_document(FSInputFile(act_path))
+            if not document_text:
+                await message.answer("⚠️ Ошибка: документ не найден")
+                await state.clear()
+                return
             
-            # Уведомление о расторжении
-            termination_text = await self.generate_termination_notice(data)
-            term_path = self.save_docx(termination_text, "Уведомление_о_расторжении.docx")
-            await message.answer_document(FSInputFile(term_path))
+            # Генерируем финальный DOCX
+            filename = f"Договор_аренды_{datetime.datetime.now().strftime('%d%m%Y')}.docx"
+            final_path = self.save_docx(document_text, filename)
+            await message.answer_document(FSInputFile(final_path))
             
-            # Дополнительные рекомендации
+            # Для аренды генерируем дополнительные документы
+            if data.get('is_rental', False):
+                await message.answer("📝 <b>Генерирую дополнительные документы...</b>")
+                
+                # Акт приема-передачи
+                act_text = await self.generate_acceptance_act(data)
+                act_path = self.save_docx(act_text, "Акт_приема-передачи.docx")
+                await message.answer_document(FSInputFile(act_path))
+                
+                # Уведомление о расторжении
+                termination_text = await self.generate_termination_notice(data)
+                term_path = self.save_docx(termination_text, "Уведомление_о_расторжении.docx")
+                await message.answer_document(FSInputFile(term_path))
+                
+                # Дополнительные рекомендации
+                await message.answer(
+                    "🔔 <b>Рекомендации по договору аренды:</b>\n\n"
+                    "1. Подпишите акт приема-передачи при заселении\n"
+                    "2. Храните все платежные документы\n"
+                    "3. Уведомляйте о расторжении за 1 месяц\n"
+                    "4. Проверьте регистрацию договора, если срок > 1 года\n\n"
+                    "Для консультации по налогам используйте /tax_help"
+                )
+            else:
+                await message.answer("✅ Документ готов! Рекомендуем проверить его у юриста.")
+            
             await message.answer(
-                "🔔 <b>Рекомендации по договору аренды:</b>\n\n"
-                "1. Подпишите акт приема-передачи при заселении\n"
-                "2. Храните все платежные документы\n"
-                "3. Уведомляйте о расторжении за 1 месяц\n"
-                "4. Проверьте регистрацию договора, если срок > 1 года\n\n"
-                "Для консультации по налогам используйте /tax_help"
+                "✅ Документы готовы! Рекомендуем:\n"
+                "1. Проверить реквизиты\n"
+                "2. Показать юристу\n"
+                "3. Сохранить копии"
             )
-        
-        await message.answer(
-            "✅ Документы готовы! Рекомендуем:\n"
-            "1. Проверить реквизиты\n"
-            "2. Показать юристу\n"
-            "3. Сохранить копии"
-        )
-        await state.clear()
+            await state.clear()
 
-        # Удаляем временные файлы
-        if os.path.exists(final_path):
-            os.unlink(final_path)
+            # Удаляем временные файлы
+            if os.path.exists(final_path):
+                os.unlink(final_path)
+            
+            temp_path = data.get('document_path', '')
+            if temp_path and os.path.exists(temp_path):
+                os.unlink(temp_path)
+
+        except Exception as e:
+            logger.error("Ошибка отправки документа: %s", e)
+            await message.answer("⚠️ Ошибка завершения. Попробуйте начать заново /start")
+            await state.clear()
+
+    async def auto_review_and_fix(self, document: str, chat_id: int) -> str:
+        try:
+            async with self.show_loading(chat_id, ChatAction.TYPING):
+                # Уточненный промпт для получения ИСПРАВЛЕННОГО документа
+                reviewed = await self.generate_gpt_response(
+                    system_prompt="""Ты юрист-арендный эксперт. Проверь договор и ВНЕСИ ПРЯМО В ТЕКСТ следующие исправления:
+                    1. Соответствие ст. 606-625 ГК РФ
+                    2. Наличие существенных условий: предмет, цена, срок
+                    3. Правильность указания реквизитов сторон
+                    4. Соответствие налогообложения (УСН/ОСН)
+                    5. Наличие условий о капитальном ремонте
+                    6. Порядок расторжения
+                    7. Условия о субаренде
+                    8. Порядок внесения изменений
+                    9. Условия о коммунальных платежах
+                    10. Порядок возврата депозита
+                    
+                    ВАЖНО: Верни ПОЛНЫЙ ИСПРАВЛЕННЫЙ ТЕКСТ ДОГОВОРА, а не описание изменений.
+                    Сохрани все плейсхолдеры вида [ПЕРЕМЕННАЯ] нетронутыми.""",
+                    user_prompt=f"Вот договор для исправления:\n\n{document}",
+                    chat_id=chat_id
+                )
+            
+            # Извлекаем текст договора из возможного форматированного ответа
+            if "```" in reviewed:
+                reviewed = reviewed.split("```")[1]
+            return reviewed.strip()
         
-        temp_path = data.get('document_path', '')
-        if temp_path and os.path.exists(temp_path):
-            os.unlink(temp_path)
+        except Exception as e:
+            logger.error("Ошибка проверки: %s", e)
+            return document
 
     async def generate_acceptance_act(self, data: dict) -> str:
         return await self.generate_gpt_response(
@@ -1103,41 +1214,6 @@ class BotApplication:
             """,
             chat_id=None
         )
-
-    async def auto_review_and_fix(self, document: str, chat_id: int) -> str:
-        try:
-            async with self.show_loading(chat_id, ChatAction.TYPING):
-                # Специальная проверка для арендных договоров
-                if "аренд" in document.lower():
-                    reviewed = await self.generate_gpt_response(
-                        system_prompt="""Ты юрист-арендный эксперт. Проверь договор:
-                        1. Соответствие ст. 606-625 ГК РФ
-                        2. Наличие существенных условий: предмет, цена, срок
-                        3. Правильность указания реквизитов сторон
-                        4. Соответствие налогообложения (УСН/ОСН)
-                        5. Наличие условий о капитальном ремонте
-                        6. Порядок расторжения
-                        7. Условия о субаренде
-                        8. Порядок внесения изменений
-                        9. Условия о коммунальных платежах
-                        10. Порядок возврата депозита""",
-                        user_prompt=f"Исправь этот договор аренды:\n\n{document}",
-                        chat_id=chat_id
-                    )
-                else:
-                    reviewed = await self.generate_gpt_response(
-                        system_prompt="Ты юридический редактор. Проверь документ на соответствие законодательству",
-                        user_prompt=f"Исправь этот документ:\n\n{document}",
-                        chat_id=chat_id
-                    )
-            
-            if "```" in reviewed:
-                reviewed = reviewed.split("```")[1]
-            return reviewed.strip()
-        
-        except Exception as e:
-            logger.error("Ошибка проверки: %s", e)
-            return document
 
     async def generate_gpt_response(self, system_prompt: str, user_prompt: str, chat_id: int) -> str:
         try:
