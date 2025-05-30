@@ -90,7 +90,7 @@ class BotApplication:
             waiting_for_initial_input = State()
             waiting_for_rent_details = State()  # Детали аренды
             waiting_for_parties_info = State()
-            current_variable = State()
+            current_variable = State()  # Состояние для ввода переменных
             document_review = State()
             waiting_for_special_terms = State()
             waiting_for_additional_clauses = State()  # Дополнительные условия
@@ -191,7 +191,7 @@ class BotApplication:
         """Конвертирует число в прописной формат (упрощенная версия)"""
         units = ['', 'один', 'два', 'три', 'четыре', 'пять', 'шесть', 'семь', 'восемь', 'девять']
         teens = ['десять', 'одиннадцать', 'двенадцать', 'тринадцать', 'четырнадцать', 'пятнадцать', 
-                'шестнадцать', 'семьнадцать', 'восемнадцать', 'девятнадцать']
+                'шестнадцать', 'семнадцать', 'восемнадцать', 'девятнадцать']
         tens = ['', '', 'двадцать', 'тридцать', 'сорок', 'пятьдесят', 
                'шестьдесят', 'семьдесят', 'восемьдесят', 'девяносто']
         hundreds = ['', 'сто', 'двести', 'триста', 'четыреста', 'пятьсот', 
@@ -589,6 +589,50 @@ class BotApplication:
                 await message.answer("⚠️ Ошибка обработки. Попробуйте снова.")
                 await state.set_state(self.states.document_review)
 
+        # НОВЫЙ ОБРАБОТЧИК ДЛЯ ВВОДА ПЕРЕМЕННЫХ
+        @self.dp.message(self.states.current_variable)
+        async def handle_variable_input(message: Message, state: FSMContext):
+            try:
+                data = await state.get_data()
+                current_var = data['current_variable']
+                user_input = message.text
+                
+                # Проверка ввода для специфичных полей
+                if "ПЛОЩАДЬ" in current_var:
+                    if not user_input.isdigit():
+                        await message.answer("⚠️ Площадь должна быть числом. Укажите число в квадратных метрах:")
+                        return
+                elif "ИНН" in current_var:
+                    if not self.validate_inn(user_input):
+                        await message.answer("⚠️ ИНН должен содержать 10 или 12 цифр. Введите корректный ИНН:")
+                        return
+                elif "ДАТА" in current_var:
+                    if not re.match(r'\d{2}\.\d{2}\.\d{4}', user_input):
+                        await message.answer("⚠️ Дата должна быть в формате ДД.ММ.ГГГГ. Введите корректную дату:")
+                        return
+                elif "АРЕНДНАЯ_ПЛАТА" in current_var or "ДЕПОЗИТ" in current_var:
+                    if not user_input.isdigit():
+                        await message.answer("⚠️ Сумма должна быть числом. Укажите сумму в рублях:")
+                        return
+                
+                # Сохраняем введенное значение
+                filled = data.get('filled_variables', {})
+                filled[current_var] = user_input
+                
+                # Обновляем индекс текущей переменной
+                await state.update_data(
+                    filled_variables=filled,
+                    current_variable_index=data['current_variable_index'] + 1
+                )
+                
+                # Переходим к следующей переменной
+                await self.ask_next_variable(message, state)
+                
+            except Exception as e:
+                logger.error("Ошибка обработки ввода переменной: %s\n%s", e, traceback.format_exc())
+                await message.answer("⚠️ Ошибка обработки. Попробуйте снова.")
+                await state.clear()
+
     async def extract_rental_params(self, text: str) -> dict:
         """Извлекает структурированные параметры аренды из текста с резервной логикой"""
         try:
@@ -732,27 +776,27 @@ class BotApplication:
         
         text_lower = text.lower()
         
-        # Определенные шаблоны
-        if re.search(r"\bип\b|\bинд\.?\s*пред\b", text_lower):
+        # 1. Проверка на физическое лицо (должна быть первой!)
+        if (re.search(r"\bфл\b|\bфиз\b|\bгражданин\b|\bг-н\b|\bфизлицо\b", text_lower) or 
+            re.search(r"\b[а-я]+\s+[а-я]\.?\s*[а-я]\.?\b", text_lower) or
+            re.search(r"[А-Я]\.\s*[А-Я]\.\s*[А-Я][а-я]+", text)):
+            return "физическое лицо"
+        
+        # 2. Проверка на ИП
+        if (re.search(r"\bип\b|\bинд\.?\s*пред\b", text_lower) or 
+            "индивидуальный предприниматель" in text_lower):
             return "ИП"
+        
+        # 3. Проверка на ООО
         if re.search(r"\bооо\b|\bао\b|\bзао\b|\bобщество\b|\bпao\b", text_lower):
             return "ООО"
-        if re.search(r"\bфл\b|\bфиз\b|\bгражданин\b|\bг-н\b", text_lower):
+        
+        # 4. Эвристика для имен (если это ФИО)
+        words = text.split()
+        if len(words) >= 2 and any(re.search(r'[а-я]', word, re.IGNORECASE) for word in words):
             return "физическое лицо"
         
-        # Эвристики для имен
-        if re.search(r"\b[а-я]+\s+[а-я]\.?\s*[а-я]\.?\b", text_lower):
-            return "физическое лицо"
-        
-        # Если содержит инициалы (И.И. Иванов)
-        if re.search(r"[А-Я]\.\s*[А-Я]\.\s*[А-Я][а-я]+", text):
-            return "физическое лицо"
-        
-        # Если в тексте есть слово "индивидуальный предприниматель"
-        if "индивидуальный предприниматель" in text_lower:
-            return "ИП"
-        
-        # По умолчанию считаем юридическим лицом
+        # 5. По умолчанию считаем юридическим лицом
         return "ООО"
 
     async def start_variable_filling(self, message: Message, state: FSMContext):
@@ -781,7 +825,7 @@ class BotApplication:
             rent_specific_vars = [
                 "АДРЕС_ОБЪЕКТА", "ПЛОЩАДЬ", "КАДАСТРОВЫЙ_НОМЕР",
                 "АРЕНДНАЯ_ПЛАТА", "СРОК_АРЕНДЫ", "ДАТА_НАЧАЛА",
-                "ДАТА_ОКОНЧАНИЯ", "СТАВКА_НДС", "ДЕПОЗИТ",
+                "ДАТА_ОКОНЧАНИЯ", "СТАвКА_НДС", "ДЕПОЗИТ",
                 "КОММУНАЛЬНЫЕ_ПЛАТЕЖИ", "ПОРЯДОК_ОПЛАТЫ"
             ]
             for var in rent_specific_vars:
@@ -892,6 +936,7 @@ class BotApplication:
             validation_hint = "\n\n⚠️ Укажите сумму в рублях (например: 50000)"
         
         await message.answer(f"{question}{validation_hint}")
+        await state.set_state(self.states.current_variable)  # Устанавливаем состояние для ввода
 
     async def prepare_final_document(self, message: Message, state: FSMContext):
         data = await state.get_data()
