@@ -20,6 +20,8 @@ from dotenv import load_dotenv
 from docx import Document
 from redis.asyncio import Redis
 from natasha import Doc, Segmenter, NewsEmbedding, NewsNERTagger
+import cachetools
+from jinja2 import Template
 
 # Настройка логирования
 logging.basicConfig(
@@ -31,6 +33,126 @@ logger = logging.getLogger(__name__)
 # Загрузка переменных окружения
 load_dotenv()
 
+# Константы для промптов OpenAI
+PROMPT_ROLES = """Ты юридический ассистент. Определи переменные, которые нужно заполнить в договоре.
+Ответь в формате JSON:
+{
+    "roles": {
+        "Арендодатель": {
+            "fields": ["ТИП_ЛИЦА", "ПАСПОРТНЫЕ_ДАННЫЕ", "ИНН", "ОГРНИП_ИЛИ_ОГРН", "БАНКОВСКИЕ_РЕКВИЗИТЫ"]
+        },
+        "Арендатор": {
+            "fields": ["ТИП_ЛИЦА", "ПАСПОРТНЫЕ_ДАННЫЕ", "ИНН", "ОГРНИП_ИЛИ_ОГРН", "БАНКОВСКИЕ_РЕКВИЗИТЫ"]
+        }
+    },
+    "field_descriptions": {
+        "ТИП_ЛИЦА": "Тип лица (физическое лицо, ИП, ООО)",
+        "ПЛОЩАДЬ": "Площадь помещения в кв.м.",
+        "КАДАСТРОВЫЙ_НОМЕР": "Кадастровый номер помещения",
+        "АРЕНДНАЯ_ПЛАТА": "Сумма арендной платы",
+        "СРОК_АРЕНДЫ": "Срок действия договора",
+        "ДАТА_НАЧАЛА": "Дата начала аренды",
+        "ДАТА_ОКОНЧАНИЯ": "Дата окончания аренды",
+        "СТАВКА_НДС": "Ставка НДС (%)",
+        "КОММУНАЛЬНЫЕ_ПЛАТЕЖИ": "Кто оплачивает коммунальные платежи",
+        "ДЕПОЗИТ": "Сумма депозита"
+    },
+    "variables": ["АДРЕС_ОБЪЕКТА", "ПЛОЩАДЬ", "КАДАСТРОВЫЙ_НОМЕР", "АРЕНДНАЯ_ПЛАТА", "СРОК_АРЕНДЫ", 
+                "ДАТА_НАЧАЛА", "ДАТА_ОКОНЧАНИЯ", "СТАВКА_НДС", "ДЕПОЗИТ", "КОММУНАЛЬНЫЕ_ПЛАТЕЖИ"]
+}"""
+
+PROMPT_RENT_PARAMS = """Ты специалист по аренде недвижимости. Извлеки параметры:
+Ответ в JSON:
+{
+    "property_type": "тип помещения (офисное, торговое, производственное, складское, жилое)",
+    "area": "площадь в кв.м",
+    "furnished": "мебель/техника (да/нет)",
+    "tax_system": "система налогообложения (ОСН/УСН/Патент)",
+    "deposit": "сумма депозита",
+    "utilities": "коммунальные платежи (включены/отдельно)",
+    "sublease": "субаренда (разрешена/запрещена)",
+    "address": "адрес (если указан)"
+}"""
+
+PROMPT_DOCUMENT_REVIEW = """Ты юрист-арендный эксперт. Проверь договор и ВНЕСИ ПРЯМО В ТЕКСТ следующие исправления:
+1. Соответствие ст. 606-625 ГК РФ
+2. Наличие существенных условий: предмет, цена, срок
+3. Правильность указания реквизитов сторон
+4. Соответствие налогообложения (УСН/ОСН)
+5. Наличие условий о капитальном ремонте
+6. Порядок расторжения
+7. Условия о субаренде
+8. Порядок внесения изменений
+9. Условия о коммунальных платежах
+10. Порядок возврата депозита
+
+ВАЖНО: Верни ПОЛНЫЙ ИСПРАВЛЕННЫЙ ТЕКСТ ДОГОВОРА, а не описание изменений.
+Сохрани все плейсхолдеры вида [ПЕРЕМЕННАЯ] нетронутыми."""
+
+# Шаблоны Jinja2 для документов
+TEMPLATE_ACCEPTANCE_ACT = """
+АКТ ПРИЕМА-ПЕРЕДАЧИ К ДОГОВОРУ АРЕНДЫ № ______
+
+г. {{ city }}                                    "____" ___________ 20___ г.
+
+{{ landlord.role }}: {{ landlord.name }}, именуем{{ 'ый' if landlord.gender == 'm' else 'ая' }} в дальнейшем "Арендодатель", 
+с одной стороны, и 
+{{ tenant.role }}: {{ tenant.name }}, именуем{{ 'ый' if tenant.gender == 'm' else 'ая' }} в дальнейшем "Арендатор", 
+с другой стороны, совместно именуемые "Стороны", составили настоящий акт о нижеследующем:
+
+1. В соответствии с Договором аренды нежилого помещения № ______ от "___"________ 20___ г. Арендодатель передает, а Арендатор принимает нежилое помещение, расположенное по адресу: {{ address }}.
+
+2. Площадь помещения: {{ area }} кв.м.
+
+3. Состояние помещения на момент передачи: {{ condition }}.
+
+4. Коммуникации и оборудование: {{ equipment }}.
+
+5. Ключи от помещения переданы.
+
+6. Стороны претензий друг к другу не имеют.
+
+ПОДПИСИ СТОРОН:
+
+Арендодатель:                          Арендатор:
+___________________ {{ landlord.name }}    ___________________ {{ tenant.name }}
+"""
+
+TEMPLATE_TERMINATION_NOTICE = """
+УВЕДОМЛЕНИЕ О РАСТОРЖЕНИИ ДОГОВОРА АРЕНДЫ
+
+г. {{ city }}                                    "____" ___________ 20___ г.
+
+{{ sender.role }}: {{ sender.name }}
+{{ sender.address }}
+
+{{ receiver.role }}: {{ receiver.name }}
+{{ receiver.address }}
+
+УВЕДОМЛЕНИЕ
+
+Настоящим уведомляем Вас о расторжении Договора аренды нежилого помещения № ______ от "___"________ 20___ г., заключенного между {{ sender.name }} и {{ receiver.name }}, в связи с {{ reason }}.
+
+Дата расторжения договора: "____" ___________ 20___ г.
+
+Просим освободить помещение по адресу: {{ address }} и произвести окончательный расчет до указанной даты.
+
+Приложение:
+1. Копия договора аренды.
+
+{{ sender.role }}:
+___________________ {{ sender.name }}
+"""
+
+# Валидаторы для полей
+VALIDATORS = {
+    "ИНН": lambda x: x.isdigit() and len(x) in (10, 12),
+    "ДАТА": lambda x: re.match(r'\d{2}\.\d{2}\.\d{4}', x),
+    "ПЛОЩАДЬ": lambda x: x.isdigit(),
+    "АРЕНДНАЯ_ПЛАТА": lambda x: x.isdigit(),
+    "ДЕПОЗИТ": lambda x: x.isdigit()
+}
+
 class BotApplication:
     def __init__(self):
         self.bot = None
@@ -40,10 +162,11 @@ class BotApplication:
         self.states = None
         self.progress_tasks = {}  # Для отслеживания задач прогресса
         
-        # Инициализация компонентов Natasha
+        # Инициализация компонентов Natasha с кэшированием
         self.segmenter = Segmenter()
         self.emb = NewsEmbedding()
         self.ner_tagger = NewsNERTagger(self.emb)
+        self.ner_cache = cachetools.LRUCache(maxsize=1000)
 
     async def initialize(self):
         os.environ.pop("HTTP_PROXY", None)
@@ -89,14 +212,13 @@ class BotApplication:
         self.dp = Dispatcher(storage=storage)
 
         class DocGenState(StatesGroup):
-            waiting_for_initial_input = State()
-            waiting_for_rent_details = State()  # Детали аренды
-            waiting_for_parties_info = State()
-            current_variable = State()  # Состояние для ввода переменных
+            initial_input = State()
+            rent_details = State()
+            parties_info = State()
+            variable_input = State()
             document_review = State()
-            waiting_for_special_terms = State()
-            waiting_for_additional_clauses = State()  # Дополнительные условия
-            parties_confirmation = State()  # Подтверждение сторон
+            additional_terms = State()
+            parties_confirmation = State()
         
         self.states = DocGenState
         self.register_handlers()
@@ -120,6 +242,16 @@ class BotApplication:
         except Exception as e:
             logger.error(f"Ошибка запуска прогресс-бара: {e}")
             return None
+
+    @asynccontextmanager
+    async def show_progress_context(self, chat_id: int, steps: int, name: str):
+        """Контекстный менеджер для прогресс-бара"""
+        message_id = await self.show_progress(chat_id, steps, name)
+        try:
+            yield
+        finally:
+            if message_id:
+                await self.complete_progress(chat_id, message_id)
 
     async def _update_progress(self, chat_id: int, message_id: int, 
                               total_steps: int, operation_name: str, start_time: float):
@@ -163,8 +295,34 @@ class BotApplication:
             pass
         finally:
             # Удаляем задачу из трекера
-            if (chat_id, message_id) in self.progress_tasks:
-                del self.progress_tasks[(chat_id, message_id)]
+            task_key = (chat_id, message_id)
+            if task_key in self.progress_tasks:
+                del self.progress_tasks[task_key]
+
+    async def complete_progress(self, chat_id: int, message_id: int):
+        """Завершает прогресс досрочно"""
+        task_key = (chat_id, message_id)
+        
+        # Проверяем существование задачи перед отменой
+        if task_key not in self.progress_tasks:
+            return
+            
+        task = self.progress_tasks[task_key]
+        task.cancel()
+        try:
+            await self.bot.edit_message_text(
+                "✅ Операция завершена!",
+                chat_id=chat_id,
+                message_id=message_id
+            )
+            await asyncio.sleep(2)
+            await self.bot.delete_message(chat_id, message_id)
+        except Exception:
+            pass
+        finally:
+            # Удаляем задачу из трекера только если она все еще существует
+            if task_key in self.progress_tasks:
+                del self.progress_tasks[task_key]
 
     def _progress_bar(self, percent: int, length: int = 20) -> str:
         """Генерирует строку прогресс-бара"""
@@ -173,23 +331,11 @@ class BotApplication:
         empty = '▁' * (length - filled_length)
         return filled + empty
 
-    async def complete_progress(self, chat_id: int, message_id: int):
-        """Завершает прогресс досрочно"""
-        if task := self.progress_tasks.get((chat_id, message_id)):
-            task.cancel()
-            try:
-                await self.bot.edit_message_text(
-                    "✅ Операция завершена!",
-                    chat_id=chat_id,
-                    message_id=message_id
-                )
-                await asyncio.sleep(2)
-                await self.bot.delete_message(chat_id, message_id)
-            except Exception:
-                pass
-            del self.progress_tasks[(chat_id, message_id)]
-
     def extract_entities(self, text: str) -> dict:
+        """Извлекает сущности с кэшированием"""
+        if text in self.ner_cache:
+            return self.ner_cache[text]
+        
         doc = Doc(text)
         doc.segment(self.segmenter)
         doc.tag_ner(self.ner_tagger)
@@ -205,40 +351,18 @@ class BotApplication:
                 person_name = span.normal if span.normal else span.text
                 persons.append(person_name)
         
-        return {
+        result = {
             'organisations': organisations,
             'persons': persons
         }
+        
+        self.ner_cache[text] = result
+        return result
 
     async def identify_roles(self, document_text: str) -> dict:
         try:
             response = await self.generate_gpt_response(
-                system_prompt="""Ты юридический ассистент. Определи переменные, которые нужно заполнить в договоре.
-                Ответь в формате JSON:
-                {
-                    "roles": {
-                        "Арендодатель": {
-                            "fields": ["ТИП_ЛИЦА", "ПАСПОРТНЫЕ_ДАННЫЕ", "ИНН", "ОГРНИП_ИЛИ_ОГРН", "БАНКОВСКИЕ_РЕКВИЗИТЫ"]
-                        },
-                        "Арендатор": {
-                            "fields": ["ТИП_ЛИЦА", "ПАСПОРТНЫЕ_ДАННЫЕ", "ИНН", "ОГРНИП_ИЛИ_ОГРН", "БАНКОВСКИЕ_РЕКВИЗИТЫ"]
-                        }
-                    },
-                    "field_descriptions": {
-                        "ТИП_ЛИЦА": "Тип лица (физическое лицо, ИП, ООО)",
-                        "ПЛОЩАДЬ": "Площадь помещения в кв.м.",
-                        "КАДАСТРОВЫЙ_НОМЕР": "Кадастровый номер помещения",
-                        "АРЕНДНАЯ_ПЛАТА": "Сумма арендной платы",
-                        "СРОК_АРЕНДЫ": "Срок действия договора",
-                        "ДАТА_НАЧАЛА": "Дата начала аренды",
-                        "ДАТА_ОКОНЧАНИЯ": "Дата окончания аренды",
-                        "СТАВКА_НДС": "Ставка НДС (%)",
-                        "КОММУНАЛЬНЫЕ_ПЛАТЕЖИ": "Кто оплачивает коммунальные платежи",
-                        "ДЕПОЗИТ": "Сумма депозита"
-                    },
-                    "variables": ["АДРЕС_ОБЪЕКТА", "ПЛОЩАДЬ", "КАДАСТРОВЫЙ_НОМЕР", "АРЕНДНАЯ_ПЛАТА", "СРОК_АРЕНДЫ", 
-                                  "ДАТА_НАЧАЛА", "ДАТА_ОКОНЧАНИЯ", "СТАВКА_НДС", "ДЕПОЗИТ", "КОММУНАЛЬНЫЕ_ПЛАТЕЖИ"]
-                }""",
+                prompt_type="roles",
                 user_prompt=f"Документ:\n{document_text}",
                 chat_id=None
             )
@@ -274,8 +398,12 @@ class BotApplication:
             return f"✍️ Введите <b>{description}</b> для <b>{role}</b>:"
         return f"✍️ Введите <b>{description}</b>:"
 
-    def validate_inn(self, inn: str) -> bool:
-        return inn.isdigit() and len(inn) in (10, 12)
+    def validate_input(self, var_name: str, value: str) -> bool:
+        """Централизованная валидация ввода"""
+        for pattern, validator in VALIDATORS.items():
+            if pattern in var_name:
+                return validator(value)
+        return True
     
     def num2words(self, num: int) -> str:
         """Конвертирует число в прописной формат (упрощенная версия)"""
@@ -327,6 +455,13 @@ class BotApplication:
                 pass
 
     def register_handlers(self):
+        self._register_start_handlers()
+        self._register_rent_handlers()
+        self._register_parties_handlers()
+        self._register_document_handlers()
+        self._register_variable_handlers()
+
+    def _register_start_handlers(self):
         @self.dp.message(F.text == "/start")
         async def cmd_start(message: Message, state: FSMContext):
             try:
@@ -340,12 +475,12 @@ class BotApplication:
                     "Просто опишите, какой договор вам нужен. Например:\n"
                     "<i>Нужен договор аренды офиса 30 м² в Москве на 1 год</i>"
                 )
-                await state.set_state(self.states.waiting_for_initial_input)
+                await state.set_state(self.states.initial_input)
             except Exception as e:
                 logger.error("Ошибка в /start: %s\n%s", e, traceback.format_exc())
                 await message.answer("⚠️ Произошла внутренняя ошибка. Попробуйте позже.")
 
-        @self.dp.message(self.states.waiting_for_initial_input)
+        @self.dp.message(self.states.initial_input)
         async def handle_description(message: Message, state: FSMContext):
             try:
                 if len(message.text) > 3000:
@@ -384,34 +519,28 @@ class BotApplication:
                         "<i>Пример: Офисное помещение 35 м², без мебели, арендодатель на УСН, "
                         "коммунальные платежи включены в аренду, депозит 2 месяца</i>"
                     )
-                    await state.set_state(self.states.waiting_for_rent_details)
+                    await state.set_state(self.states.rent_details)
                 else:
                     await message.answer(
                         "👥 <b>Укажите стороны договора:</b>\n\n"
                         "<i>Пример:\nАрендодатель: ООО 'Ромашка'\n"
                         "Арендатор: Иван Иванов (ИП)</i>"
                     )
-                    await state.set_state(self.states.waiting_for_parties_info)
+                    await state.set_state(self.states.parties_info)
                 
             except Exception as e:
                 logger.error("Ошибка обработки: %s\n%s", e, traceback.format_exc())
                 await message.answer("⚠️ Ошибка обработки. Попробуйте снова.")
                 await state.clear()
 
-        @self.dp.message(self.states.waiting_for_rent_details)
+    def _register_rent_handlers(self):
+        @self.dp.message(self.states.rent_details)
         async def handle_rent_details(message: Message, state: FSMContext):
             try:
                 rent_details = message.text
                 await state.update_data(rent_details=rent_details)
                 
-                # Запускаем прогресс-бар (оцениваем 8 шагов)
-                progress_id = None
-                try:
-                    progress_id = await self.show_progress(message.chat.id, 8, "Анализ деталей аренды")
-                except Exception as e:
-                    logger.error(f"Ошибка запуска прогресса: {e}")
-                
-                try:
+                async with self.show_progress_context(message.chat.id, 8, "Анализ деталей аренды"):
                     # Извлекаем структурированные параметры аренды
                     rental_params = await self.extract_rental_params(rent_details)
                     await state.update_data(rental_params=rental_params)
@@ -458,30 +587,21 @@ class BotApplication:
                         "<i>Пример:\nАрендодатель: ИП Сидоров А.В.\n"
                         "Арендатор: ООО 'Вектор'</i>"
                     )
-                    await state.set_state(self.states.waiting_for_parties_info)
-                finally:
-                    if progress_id:
-                        await self.complete_progress(message.chat.id, progress_id)
+                    await state.set_state(self.states.parties_info)
                 
             except Exception as e:
                 logger.error("Ошибка обработки деталей аренды: %s\n%s", e, traceback.format_exc())
                 await message.answer("⚠️ Ошибка обработки деталей аренды. Попробуйте снова.")
                 await state.clear()
 
-        @self.dp.message(self.states.waiting_for_parties_info)
+    def _register_parties_handlers(self):
+        @self.dp.message(self.states.parties_info)
         async def handle_parties_info(message: Message, state: FSMContext):
             try:
                 parties_text = message.text
                 await state.update_data(parties_text=parties_text)
                 
-                # Запускаем прогресс-бар (оцениваем 10 шагов)
-                progress_id = None
-                try:
-                    progress_id = await self.show_progress(message.chat.id, 10, "Анализ сторон договора")
-                except Exception as e:
-                    logger.error(f"Ошибка запуска прогресса: {e}")
-                
-                try:
+                async with self.show_progress_context(message.chat.id, 10, "Анализ сторон договора"):
                     # Извлекаем информацию о сторонах
                     parties_info = await self.extract_parties_info(parties_text)
                     
@@ -524,9 +644,6 @@ class BotApplication:
                     
                     await state.update_data(parties_info=parties_info)
                     await state.set_state(self.states.parties_confirmation)
-                finally:
-                    if progress_id:
-                        await self.complete_progress(message.chat.id, progress_id)
                 
             except Exception as e:
                 logger.error("Ошибка обработки информации о сторонах: %s\n%s", e, traceback.format_exc())
@@ -538,14 +655,7 @@ class BotApplication:
             await callback.message.delete()
             data = await state.get_data()
             
-            # Запускаем прогресс-бар (оцениваем 15 шагов)
-            progress_id = None
-            try:
-                progress_id = await self.show_progress(callback.message.chat.id, 15, "Генерация договора")
-            except Exception as e:
-                logger.error(f"Ошибка запуска прогресса: {e}")
-            
-            try:
+            async with self.show_progress_context(callback.message.chat.id, 15, "Генерация договора"):
                 # Генерируем черновик с учетом информации о сторонах
                 await callback.message.answer("🧠 Генерирую договор аренды...")
                 
@@ -636,9 +746,6 @@ class BotApplication:
                     "📄 Черновик договора готов! Теперь заполним обязательные реквизиты."
                 )
                 await self.start_variable_filling(callback.message, state)
-            finally:
-                if progress_id:
-                    await self.complete_progress(callback.message.chat.id, progress_id)
 
         @self.dp.callback_query(F.data == "parties_correct")
         async def handle_parties_correct(callback: types.CallbackQuery, state: FSMContext):
@@ -649,8 +756,9 @@ class BotApplication:
                 "<code>Арендатор: ФИО/Название</code>\n\n"
                 "Или просто перечислите стороны через запятую:"
             )
-            await state.set_state(self.states.waiting_for_parties_info)
+            await state.set_state(self.states.parties_info)
 
+    def _register_document_handlers(self):
         @self.dp.callback_query(F.data == "add_clauses")
         async def handle_add_clauses(callback: types.CallbackQuery, state: FSMContext):
             await callback.message.answer(
@@ -662,9 +770,9 @@ class BotApplication:
                 "5. Страхование имущества\n\n"
                 "Укажите номера нужных условий через запятую (например: 1,3,5)"
             )
-            await state.set_state(self.states.waiting_for_additional_clauses)
+            await state.set_state(self.states.additional_terms)
 
-        @self.dp.message(self.states.waiting_for_additional_clauses)
+        @self.dp.message(self.states.additional_terms)
         async def handle_additional_clauses(message: Message, state: FSMContext):
             try:
                 selected_clauses = message.text
@@ -673,14 +781,7 @@ class BotApplication:
                 data = await state.get_data()
                 base_text = data.get("final_document", "")
                 
-                # Запускаем прогресс-бар (оцениваем 5 шагов)
-                progress_id = None
-                try:
-                    progress_id = await self.show_progress(message.chat.id, 5, "Добавление условий")
-                except Exception as e:
-                    logger.error(f"Ошибка запуска прогресса: {e}")
-                
-                try:
+                async with self.show_progress_context(message.chat.id, 5, "Добавление условий"):
                     await message.answer("🔧 Добавляю выбранные условия в договор...")
                     updated_doc = await self.generate_gpt_response(
                         system_prompt="Ты юридический редактор. Добавь в договор аренды выбранные условия.",
@@ -711,60 +812,12 @@ class BotApplication:
                         "- Добавить свои особые условия",
                         reply_markup=keyboard
                     )
-                finally:
-                    if progress_id:
-                        await self.complete_progress(message.chat.id, progress_id)
                     
             except Exception as e:
                 logger.error("Ошибка обработки: %s\n%s", e, traceback.format_exc())
                 await message.answer("⚠️ Ошибка обработки. Попробуйте снова.")
                 await state.set_state(self.states.document_review)
 
-        # НОВЫЙ ОБРАБОТЧИК ДЛЯ ВВОДА ПЕРЕМЕННЫХ
-        @self.dp.message(self.states.current_variable)
-        async def handle_variable_input(message: Message, state: FSMContext):
-            try:
-                data = await state.get_data()
-                current_var = data['current_variable']
-                user_input = message.text
-                
-                # Проверка ввода для специфичных полей
-                if "ПЛОЩАДЬ" in current_var:
-                    if not user_input.isdigit():
-                        await message.answer("⚠️ Площадь должна быть числом. Укажите число в квадратных метрах:")
-                        return
-                elif "ИНН" in current_var:
-                    if not self.validate_inn(user_input):
-                        await message.answer("⚠️ ИНН должен содержать 10 или 12 цифр. Введите корректный ИНН:")
-                        return
-                elif "ДАТА" in current_var:
-                    if not re.match(r'\d{2}\.\d{2}\.\d{4}', user_input):
-                        await message.answer("⚠️ Дата должна быть в формате ДД.ММ.ГГГГ. Введите корректную дату:")
-                        return
-                elif "АРЕНДНАЯ_ПЛАТА" in current_var or "ДЕПОЗИТ" in current_var:
-                    if not user_input.isdigit():
-                        await message.answer("⚠️ Сумма должна быть числом. Укажите сумму в рублях:")
-                        return
-                
-                # Сохраняем введенное значение
-                filled = data.get('filled_variables', {})
-                filled[current_var] = user_input
-                
-                # Обновляем индекс текущей переменной
-                await state.update_data(
-                    filled_variables=filled,
-                    current_variable_index=data['current_variable_index'] + 1
-                )
-                
-                # Переходим к следующей переменной
-                await self.ask_next_variable(message, state)
-                
-            except Exception as e:
-                logger.error("Ошибка обработки ввода переменной: %s\n%s", e, traceback.format_exc())
-                await message.answer("⚠️ Ошибка обработки. Попробуйте снова.")
-                await state.clear()
-
-        # НОВЫЕ ОБРАБОТЧИКИ ДЛЯ КНОПОК
         @self.dp.callback_query(F.data == "confirm_document")
         async def handle_confirm_document(callback: types.CallbackQuery, state: FSMContext):
             try:
@@ -779,23 +832,16 @@ class BotApplication:
             await callback.message.answer(
                 "✏️ Введите ваши особые условия, которые нужно добавить в договор:"
             )
-            await state.set_state(self.states.waiting_for_special_terms)
+            await state.set_state(self.states.additional_terms)
 
-        @self.dp.message(self.states.waiting_for_special_terms)
+        @self.dp.message(self.states.additional_terms)
         async def handle_special_terms(message: Message, state: FSMContext):
             try:
                 custom_terms = message.text
                 data = await state.get_data()
                 base_text = data.get("final_document", "")
                 
-                # Запускаем прогресс-бар (оцениваем 5 шагов)
-                progress_id = None
-                try:
-                    progress_id = await self.show_progress(message.chat.id, 5, "Добавление условий")
-                except Exception as e:
-                    logger.error(f"Ошибка запуска прогресса: {e}")
-                
-                try:
+                async with self.show_progress_context(message.chat.id, 5, "Добавление условий"):
                     updated_doc = await self.generate_gpt_response(
                         system_prompt="Ты юридический редактор. Добавь в договор аренды пользовательские условия.",
                         user_prompt=f"Добавь эти особые условия: {custom_terms}\n\nВ текущий договор:\n{base_text}",
@@ -816,31 +862,59 @@ class BotApplication:
                         [InlineKeyboardButton(text="✅ Завершить", callback_data="confirm_document")]
                     ])
                     await message.answer("Документ обновлен. Вы можете завершить оформление.", reply_markup=keyboard)
-                finally:
-                    if progress_id:
-                        await self.complete_progress(message.chat.id, progress_id)
                     
             except Exception as e:
                 logger.error("Ошибка добавления условий: %s", e)
                 await message.answer("⚠️ Ошибка обработки. Попробуйте снова.")
                 await state.set_state(self.states.document_review)
 
+    def _register_variable_handlers(self):
+        @self.dp.message(self.states.variable_input)
+        async def handle_variable_input(message: Message, state: FSMContext):
+            try:
+                data = await state.get_data()
+                current_var = data['current_variable']
+                user_input = message.text
+                
+                # Валидация ввода
+                if not self.validate_input(current_var, user_input):
+                    # Формируем подсказку для пользователя
+                    validation_hint = ""
+                    if "ИНН" in current_var:
+                        validation_hint = "ИНН должен содержать 10 или 12 цифр"
+                    elif "ДАТА" in current_var:
+                        validation_hint = "Дата должна быть в формате ДД.ММ.ГГГГ"
+                    elif "ПЛОЩАДЬ" in current_var:
+                        validation_hint = "Площадь должна быть числом в кв.м."
+                    elif "АРЕНДНАЯ_ПЛАТА" in current_var or "ДЕПОЗИТ" in current_var:
+                        validation_hint = "Сумма должна быть числом в рублях"
+                    
+                    await message.answer(f"⚠️ Неверный формат. {validation_hint}\nПожалуйста, введите снова:")
+                    return
+                
+                # Сохраняем введенное значение
+                filled = data.get('filled_variables', {})
+                filled[current_var] = user_input
+                
+                # Обновляем индекс текущей переменной
+                await state.update_data(
+                    filled_variables=filled,
+                    current_variable_index=data['current_variable_index'] + 1
+                )
+                
+                # Переходим к следующей переменной
+                await self.ask_next_variable(message, state)
+                
+            except Exception as e:
+                logger.error("Ошибка обработки ввода переменной: %s\n%s", e, traceback.format_exc())
+                await message.answer("⚠️ Ошибка обработки. Попробуйте снова.")
+                await state.clear()
+
     async def extract_rental_params(self, text: str) -> dict:
         """Извлекает структурированные параметры аренды из текста с резервной логикой"""
         try:
             response = await self.generate_gpt_response(
-                system_prompt="""Ты специалист по аренде недвижимости. Извлеки параметры:
-                Ответ в JSON:
-                {
-                    "property_type": "тип помещения (офисное, торговое, производственное, складское, жилое)",
-                    "area": "площадь в кв.м",
-                    "furnished": "мебель/техника (да/нет)",
-                    "tax_system": "система налогообложения (ОСН/УСН/Патент)",
-                    "deposit": "сумма депозита",
-                    "utilities": "коммунальные платежи (включены/отдельно)",
-                    "sublease": "субаренда (разрешена/запрещена)",
-                    "address": "адрес (если указан)"
-                }""",
+                prompt_type="rent_params",
                 user_prompt=text,
                 chat_id=None
             )
@@ -1139,18 +1213,8 @@ class BotApplication:
             index += 1
             
         if index >= len(variables):
-            # Запускаем прогресс-бар для подготовки документа (оцениваем 5 шагов)
-            progress_id = None
-            try:
-                progress_id = await self.show_progress(message.chat.id, 5, "Подготовка документа")
-            except Exception as e:
-                logger.error(f"Ошибка запуска прогресса: {e}")
-            
-            try:
+            async with self.show_progress_context(message.chat.id, 5, "Подготовка документа"):
                 await self.prepare_final_document(message, state)
-            finally:
-                if progress_id:
-                    await self.complete_progress(message.chat.id, progress_id)
             return
             
         current_var = variables[index]
@@ -1179,7 +1243,7 @@ class BotApplication:
             validation_hint = "\n\n⚠️ Укажите сумму в рублях (например: 50000)"
         
         await message.answer(f"{question}{validation_hint}")
-        await state.set_state(self.states.current_variable)  # Устанавливаем состояние для ввода
+        await state.set_state(self.states.variable_input)  # Устанавливаем состояние для ввода
 
     async def prepare_final_document(self, message: Message, state: FSMContext):
         try:
@@ -1257,14 +1321,7 @@ class BotApplication:
             
             # Для аренды генерируем дополнительные документы
             if data.get('is_rental', False):
-                # Прогресс-бар для генерации доп. документов
-                progress_id = None
-                try:
-                    progress_id = await self.show_progress(message.chat.id, 3, "Генерация документов")
-                except Exception as e:
-                    logger.error(f"Ошибка запуска прогресса: {e}")
-                
-                try:
+                async with self.show_progress_context(message.chat.id, 3, "Генерация документов"):
                     await message.answer("📝 <b>Генерирую дополнительные документы...</b>")
                     
                     # Акт приема-передачи
@@ -1286,11 +1343,6 @@ class BotApplication:
                         "4. Проверьте регистрацию договора, если срок > 1 года\n\n"
                         "Для консультации по налогам используйте /tax_help"
                     )
-                finally:
-                    if progress_id:
-                        await self.complete_progress(message.chat.id, progress_id)
-            else:
-                await message.answer("✅ Документ готов! Рекомендуем проверить его у юриста.")
             
             await message.answer(
                 "✅ Документы готовы! Рекомендуем:\n"
@@ -1318,20 +1370,7 @@ class BotApplication:
             async with self.show_loading(chat_id, ChatAction.TYPING):
                 # Уточненный промпт для получения ИСПРАВЛЕННОГО документа
                 reviewed = await self.generate_gpt_response(
-                    system_prompt="""Ты юрист-арендный эксперт. Проверь договор и ВНЕСИ ПРЯМО В ТЕКСТ следующие исправления:
-                    1. Соответствие ст. 606-625 ГК РФ
-                    2. Наличие существенных условий: предмет, цена, срок
-                    3. Правильность указания реквизитов сторон
-                    4. Соответствие налогообложения (УСН/ОСН)
-                    5. Наличие условий о капитальном ремонте
-                    6. Порядок расторжения
-                    7. Условия о субаренде
-                    8. Порядок внесения изменений
-                    9. Условия о коммунальных платежах
-                    10. Порядок возврата депозита
-                    
-                    ВАЖНО: Верни ПОЛНЫЙ ИСПРАВЛЕННЫЙ ТЕКСТ ДОГОВОРА, а не описание изменений.
-                    Сохрани все плейсхолдеры вида [ПЕРЕМЕННАЯ] нетронутыми.""",
+                    system_prompt=PROMPT_DOCUMENT_REVIEW,
                     user_prompt=f"Вот договор для исправления:\n\n{document}",
                     chat_id=chat_id
                 )
@@ -1346,40 +1385,87 @@ class BotApplication:
             return document
 
     async def generate_acceptance_act(self, data: dict) -> str:
-        return await self.generate_gpt_response(
-            system_prompt="""Ты юрист. Сгенерируй акт приема-передачи помещения к договору аренды.
-            Укажи:
-            1. Дату и место составления
-            2. Ссылку на договор аренды
-            3. Описание передаваемого помещения
-            4. Состояние помещения и оборудования
-            5. Подписи сторон""",
-            user_prompt=f"""
-            Данные договора:
-            {data.get('final_document', '')}
-            """,
-            chat_id=None
-        )
+        """Генерирует акт приема-передачи с использованием шаблона Jinja2"""
+        parties = data.get('parties_info', {}).get('parties', [])
+        landlord = next((p for p in parties if p['role'] == 'Арендодатель'), None)
+        tenant = next((p for p in parties if p['role'] == 'Арендатор'), None)
+        rental_params = data.get('rental_params', {})
+        
+        # Если не нашли сторон в данных, используем GPT как запасной вариант
+        if not landlord or not tenant:
+            return await self.generate_gpt_response(
+                system_prompt="Ты юрист. Сгенерируй акт приема-передачи помещения к договору аренды.",
+                user_prompt=f"Данные договора:\n{data.get('final_document', '')}",
+                chat_id=None
+            )
+        
+        # Формируем контекст для шаблона
+        context = {
+            'city': "Москва",  # Можно извлечь из адреса
+            'landlord': {
+                'role': landlord['type'],
+                'name': landlord['name'],
+                'gender': 'm'  # По умолчанию мужской род
+            },
+            'tenant': {
+                'role': tenant['type'],
+                'name': tenant['name'],
+                'gender': 'm'
+            },
+            'address': rental_params.get('address', '[АДРЕС_ОБЪЕКТА]'),
+            'area': rental_params.get('area', '[ПЛОЩАДЬ]'),
+            'condition': "удовлетворительное, соответствует договору",
+            'equipment': "электричество, водоснабжение, отопление"
+        }
+        
+        template = Template(TEMPLATE_ACCEPTANCE_ACT)
+        return template.render(context)
 
     async def generate_termination_notice(self, data: dict) -> str:
-        return await self.generate_gpt_response(
-            system_prompt="""Ты юрист. Сгенерируй уведомление о расторжении договора аренды.
-            Включи:
-            1. Реквизиты сторон
-            2. Ссылку на договор
-            3. Дату расторжения
-            4. Причину расторжения (если требуется)
-            5. Порядок возврата депозита
-            6. Подпись""",
-            user_prompt=f"""
-            Данные договора:
-            {data.get('final_document', '')}
-            """,
-            chat_id=None
-        )
+        """Генерирует уведомление о расторжении с использованием шаблона Jinja2"""
+        parties = data.get('parties_info', {}).get('parties', [])
+        landlord = next((p for p in parties if p['role'] == 'Арендодатель'), None)
+        tenant = next((p for p in parties if p['role'] == 'Арендатор'), None)
+        rental_params = data.get('rental_params', {})
+        
+        # Если не нашли сторон в данных, используем GPT как запасной вариант
+        if not landlord or not tenant:
+            return await self.generate_gpt_response(
+                system_prompt="Ты юрист. Сгенерируй уведомление о расторжении договора аренды.",
+                user_prompt=f"Данные договора:\n{data.get('final_document', '')}",
+                chat_id=None
+            )
+        
+        # Формируем контекст для шаблона
+        context = {
+            'city': "Москва",
+            'sender': {
+                'role': tenant['type'],
+                'name': tenant['name'],
+                'address': "[АДРЕС_АРЕНДАТОРА]"
+            },
+            'receiver': {
+                'role': landlord['type'],
+                'name': landlord['name'],
+                'address': "[АДРЕС_АРЕНДОДАТЕЛЯ]"
+            },
+            'address': rental_params.get('address', '[АДРЕС_ОБЪЕКТА]'),
+            'reason': "истечением срока действия договора"
+        }
+        
+        template = Template(TEMPLATE_TERMINATION_NOTICE)
+        return template.render(context)
 
-    async def generate_gpt_response(self, system_prompt: str, user_prompt: str, chat_id: int) -> str:
+    async def generate_gpt_response(self, system_prompt: str = None, user_prompt: str = None, 
+                                  prompt_type: str = None, chat_id: int = None) -> str:
+        """Унифицированный метод для работы с OpenAI"""
         try:
+            # Если указан тип промпта, используем предопределенный
+            if prompt_type == "roles":
+                system_prompt = PROMPT_ROLES
+            elif prompt_type == "rent_params":
+                system_prompt = PROMPT_RENT_PARAMS
+            
             if chat_id:
                 async with self.show_loading(chat_id, ChatAction.TYPING):
                     response = await self.openai_client.chat.completions.create(
@@ -1412,19 +1498,25 @@ class BotApplication:
             return "❌ Ошибка генерации. Попробуйте позже."
 
     def save_docx(self, text: str, filename: str) -> str:
+        """Сохраняет текст в DOCX с использованием временных файлов"""
         try:
             doc = Document()
             for para in text.split("\n"):
                 if para.strip():
                     doc.add_paragraph(para)
             
-            temp_dir = tempfile.gettempdir()
-            filepath = os.path.join(temp_dir, filename)
-            doc.save(filepath)
-            return filepath
+            with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
+                doc.save(tmp.name)
+                return tmp.name
         except Exception as e:
             logger.error("Ошибка создания DOCX: %s", e)
             raise
+
+    async def update_state(self, state: FSMContext, **kwargs):
+        """Селективное обновление состояния"""
+        data = await state.get_data()
+        data.update(kwargs)
+        await state.set_data(data)
 
     async def shutdown(self):
         try:
